@@ -13,6 +13,7 @@ import anthropic
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from docspilot.logging import get_logger
+from docspilot.rag.retrieve import Retriever
 from docspilot.tickets import Severity, TicketStore
 
 log = get_logger("tools")
@@ -35,9 +36,18 @@ class ToolError(Exception):
 
 
 @dataclass(frozen=True, slots=True)
+class Source:
+    path: str
+    title: str
+    section: str
+
+
+@dataclass(frozen=True, slots=True)
 class ToolOutcome:
     content: str
     is_error: bool = False
+    #: Documents the model was shown (for citation validation); never sent to the model.
+    sources: tuple[Source, ...] = ()
 
 
 class ToolInput(BaseModel):
@@ -63,6 +73,9 @@ class Tool(ABC):
     def summarize(self, args: Any) -> str:
         """Human-readable description of what will happen (shown at confirmation)."""
         return f"{self.name}({args.model_dump_json()})"
+
+    def sources(self, output: dict[str, Any]) -> tuple[Source, ...]:
+        return ()
 
     @abstractmethod
     async def run(self, args: Any, ctx: ToolContext) -> dict[str, Any]: ...
@@ -118,8 +131,12 @@ class ToolRegistry:
             return ToolOutcome(f"{tool.name} failed due to an internal error.", True)
         text = json.dumps(output, ensure_ascii=False, default=str)
         if len(text) > MAX_TOOL_OUTPUT_CHARS:
-            text = text[:MAX_TOOL_OUTPUT_CHARS] + '..."[truncated]'
-        return ToolOutcome(text)
+            # Backstop for tools that did not budget themselves. Stays valid JSON so the
+            # model can tell it was cut; never emit a chopped-off JSON document.
+            preview = text[: MAX_TOOL_OUTPUT_CHARS - 200]
+            text = json.dumps({"truncated": True, "preview": preview}, ensure_ascii=False)
+            return ToolOutcome(text)
+        return ToolOutcome(text, sources=tool.sources(output))
 
 
 # --- concrete tools -----------------------------------------------------------
@@ -191,5 +208,62 @@ class GetTicketTool(Tool):
         }
 
 
-def default_tools() -> list[Tool]:
-    return [CreateTicketTool(), GetTicketTool()]
+class SearchDocsInput(ToolInput):
+    query: str = Field(
+        min_length=2,
+        max_length=300,
+        description="Specific, self-contained search query using product terms. "
+        "Do not use pronouns or refer to earlier messages.",
+    )
+
+
+class SearchDocsTool(Tool):
+    name = "search_docs"
+    description = (
+        "Search the Acme Billing product documentation and return the most relevant "
+        "passages with their source paths and last-updated dates. Call this before "
+        "answering any question about the product (pricing, limits, how-tos, policies, "
+        "API behaviour). If results look off-topic, call again with a different query."
+    )
+    input_model = SearchDocsInput
+    #: Budget for the *serialised* result (JSON overhead and escaping included), kept
+    #: below MAX_TOOL_OUTPUT_CHARS so the generic backstop never triggers.
+    char_budget = 7000
+
+    def __init__(self, retriever: Retriever) -> None:
+        self._retriever = retriever
+
+    async def run(self, args: SearchDocsInput, ctx: ToolContext) -> dict[str, Any]:
+        result = await self._retriever.search(args.query)
+        results: list[dict[str, Any]] = []
+        for hit in result.hits:  # best first: when the budget runs out the tail is dropped
+            c = hit.chunk
+            item = {
+                "source": c.path,
+                "title": c.title,
+                "section": c.heading_path,
+                "updated": c.updated.isoformat() if c.updated else None,
+                "text": c.text,
+            }
+            if len(json.dumps([*results, item], ensure_ascii=False)) > self.char_budget:
+                if not results:  # even the best chunk alone is too big: shorten its text
+                    room = self.char_budget - len(json.dumps({**item, "text": ""})) - 40
+                    item["text"] = c.text[: max(room, 200)] + " …[truncated]"
+                    results.append(item)
+                break
+            results.append(item)
+        if not results:
+            return {"results": [], "note": "No relevant documentation found for this query."}
+        return {"results": results}
+
+    def sources(self, output: dict[str, Any]) -> tuple[Source, ...]:
+        return tuple(
+            Source(r["source"], r["title"], r["section"]) for r in output.get("results", [])
+        )
+
+
+def default_tools(retriever: Retriever | None = None) -> list[Tool]:
+    tools: list[Tool] = [CreateTicketTool(), GetTicketTool()]
+    if retriever is not None:
+        tools.append(SearchDocsTool(retriever))
+    return tools

@@ -24,6 +24,7 @@ class Settings(BaseSettings):
         env_prefix="DOCSPILOT_",
         env_file=".env",
         extra="ignore",
+        populate_by_name=True,
     )
 
     env: Literal["dev", "test", "prod"] = "dev"
@@ -35,6 +36,20 @@ class Settings(BaseSettings):
 
     # "fake" = canned offline replies (UI demos / no API key). Never allowed in prod.
     llm_backend: Literal["anthropic", "fake"] = "anthropic"
+
+    # --- storage & retrieval ---
+    database_url: str | None = Field(default=None, validation_alias="DATABASE_URL")
+    migrations_dir: Path = PROJECT_ROOT / "migrations"
+    corpus_dir: Path = PROJECT_ROOT / "corpus"
+    voyage_api_key: SecretStr | None = Field(default=None, validation_alias="VOYAGE_API_KEY")
+    embedder: Literal["auto", "voyage", "hash"] = "auto"  # auto: voyage if key else hash
+    voyage_embed_model: str = "voyage-3.5"
+    rerank: Literal["auto", "voyage", "none"] = "auto"
+    voyage_rerank_model: str = "rerank-2.5"
+    retrieval_k: int = Field(default=5, ge=1, le=20)
+    retrieval_candidates: int = Field(default=20, ge=1, le=100)
+    rerank_min_score: float | None = None
+    auto_ingest: bool = True  # ingest at startup when the index is empty / in-memory
 
     # Main answer model vs. cheap model for classification / judging.
     model_answer: str = "claude-opus-5-5"
@@ -60,7 +75,19 @@ class Settings(BaseSettings):
     max_assistant_chars: int = Field(default=20_000, ge=1)  # prior answers echoed back
     max_body_bytes: int = Field(default=256 * 1024, ge=1024)
 
-    @field_validator("anthropic_api_key", mode="before")
+    @property
+    def resolved_embedder(self) -> Literal["voyage", "hash"]:
+        if self.embedder == "auto":
+            return "voyage" if self.voyage_api_key else "hash"
+        return self.embedder
+
+    @property
+    def resolved_rerank(self) -> Literal["voyage", "none"]:
+        if self.rerank == "auto":
+            return "voyage" if self.voyage_api_key else "none"
+        return self.rerank
+
+    @field_validator("anthropic_api_key", "voyage_api_key", "database_url", mode="before")
     @classmethod
     def _blank_key_is_none(cls, v: object) -> object:
         # `.env.example` ships `ANTHROPIC_API_KEY=`: blank must not satisfy fail-fast.
@@ -74,6 +101,14 @@ class Settings(BaseSettings):
             raise ValueError("ANTHROPIC_API_KEY is required when DOCSPILOT_ENV=prod")
         if self.env == "prod" and self.llm_backend != "anthropic":
             raise ValueError("DOCSPILOT_LLM_BACKEND must be 'anthropic' in prod")
+        if self.env == "prod" and self.database_url is None:
+            raise ValueError("DATABASE_URL is required when DOCSPILOT_ENV=prod")
+        if self.env == "prod" and self.resolved_embedder == "hash":
+            raise ValueError("a real embedder (VOYAGE_API_KEY) is required in prod")
+        if "voyage" in (self.embedder, self.rerank) and self.voyage_api_key is None:
+            raise ValueError("VOYAGE_API_KEY is required for embedder/rerank=voyage")
+        if self.rerank_min_score is not None and self.resolved_rerank == "none":
+            raise ValueError("DOCSPILOT_RERANK_MIN_SCORE needs a reranker (it is a rerank score)")
         return self
 
 

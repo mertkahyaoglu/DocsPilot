@@ -8,6 +8,7 @@ results the model can react to, and write tools pause for human approval.
 from __future__ import annotations
 
 import asyncio
+import re
 import time
 from collections.abc import AsyncGenerator
 from contextlib import aclosing
@@ -15,7 +16,14 @@ from dataclasses import dataclass
 from typing import Any
 
 from docspilot.agent.pending import PendingAction, PendingStore
-from docspilot.agent.tools import Tool, ToolContext, ToolInput, ToolOutcome, ToolRegistry
+from docspilot.agent.tools import (
+    Source,
+    Tool,
+    ToolContext,
+    ToolInput,
+    ToolOutcome,
+    ToolRegistry,
+)
 from docspilot.config import Effort
 from docspilot.llm.types import (
     LLM,
@@ -71,6 +79,27 @@ class AgentFinished:
     model: str
     text: str = ""
     served_by_fallback: bool = False
+    #: Sources the answer cites, restricted to documents actually retrieved this turn.
+    citations: tuple[Source, ...] = ()
+    #: Everything retrieved this turn (cited or not), for evals and debugging.
+    retrieved: tuple[Source, ...] = ()
+
+
+_BRACKET = re.compile(r"\[([^\[\]\n]*?\.md[^\[\]\n]*)\]")
+
+
+def extract_citations(text: str, retrieved: dict[str, Source]) -> tuple[Source, ...]:
+    """Citations are model output, so they are untrusted: keep only paths that were
+    really retrieved this turn. A hallucinated path never reaches the user as a source."""
+    out: dict[str, Source] = {}
+    for group in _BRACKET.findall(text):
+        # Tolerate "[a.md, b.md]", "[a.md#section]", "[source: a.md]".
+        for part in re.split(r"[;,]", group):
+            path = part.strip().removeprefix("source:").removeprefix("doc:").strip()
+            path = path.split("#", 1)[0].strip()
+            if path in retrieved:
+                out.setdefault(path, retrieved[path])
+    return tuple(out.values())
 
 
 AgentEvent = TextDelta | StreamReset | ToolStart | ToolEnd | NeedsConfirmation | AgentFinished
@@ -168,6 +197,7 @@ class Agent:
                     steps_left=max(pending.steps_left, 1),
                     usage=pending.usage,
                     steps=pending.steps,
+                    retrieved=pending.retrieved,
                 )
             ) as stream:
                 async for event in stream:
@@ -199,8 +229,10 @@ class Agent:
         steps_left: int,
         usage: Usage | None = None,
         steps: int = 0,
+        retrieved: dict[str, Source] | None = None,
     ) -> AsyncGenerator[AgentEvent, None]:
         usage = usage or Usage()
+        retrieved = dict(retrieved or {})
         cfg = self._config
         while steps_left > 0:
             steps += 1
@@ -246,6 +278,8 @@ class Agent:
                     result.model,
                     text=result.text,
                     served_by_fallback=result.served_by_fallback,
+                    citations=extract_citations(result.text, retrieved),
+                    retrieved=tuple(retrieved.values()),
                 )
                 return
 
@@ -267,11 +301,12 @@ class Agent:
                 yield ToolStart(call.id, call.name, call.input)
             for call, outcome, ms in await self._run_concurrently(runnable, ctx):
                 outcomes[call.id] = outcome
+                retrieved.update({src.path: src for src in outcome.sources})
                 yield ToolEnd(call.id, call.name, outcome.is_error, ms)
 
             if awaiting:
                 yield await self._pause(
-                    messages, result, outcomes, awaiting, ctx, steps_left, usage, steps
+                    messages, result, outcomes, awaiting, ctx, steps_left, usage, steps, retrieved
                 )
                 return
             messages.append(self._results_message(result.tool_calls, outcomes))
@@ -303,6 +338,7 @@ class Agent:
         steps_left: int,
         usage: Usage,
         steps: int,
+        retrieved: dict[str, Source],
     ) -> NeedsConfirmation:
         pending = PendingAction(
             id=self._pending.new_id(),
@@ -315,6 +351,7 @@ class Agent:
             expires_at=time.time() + self._ttl,
             usage=usage,
             steps=steps,
+            retrieved=retrieved,
         )
         await self._pending.put(pending)
         items = []

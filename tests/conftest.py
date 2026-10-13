@@ -20,6 +20,10 @@ def settings() -> Settings:
         env="test",
         prompts_dir=ROOT / "prompts",
         web_dir=ROOT / "web",
+        corpus_dir=ROOT / "corpus",
+        database_url=None,  # never touch a developer's database from unit tests
+        embedder="hash",
+        rerank="none",
         _env_file=None,  # type: ignore[call-arg]
     )
 

@@ -10,6 +10,19 @@ permissions:
 jobs:
   check:
     runs-on: ubuntu-latest
+    services:
+      db:
+        image: pgvector/pgvector:pg17
+        env:
+          POSTGRES_USER: docspilot
+          POSTGRES_PASSWORD: docspilot
+          POSTGRES_DB: docspilot
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U docspilot" --health-interval 5s
+          --health-timeout 5s --health-retries 20
+    env:
+      TEST_DATABASE_URL: postgresql://docspilot:docspilot@localhost:5432/docspilot
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v5
