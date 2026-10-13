@@ -1,0 +1,23 @@
+# python
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+dist/
+*.egg-info/
+
+# env / secrets
+.env
+.env.*
+!.env.example
+
+# local
+.DS_Store
+.idea/
+.vscode/
+evals/results/
+*.log
