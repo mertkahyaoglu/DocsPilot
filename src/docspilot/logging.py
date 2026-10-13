@@ -12,6 +12,7 @@ from opentelemetry import trace
 from structlog.typing import Processor
 
 from docspilot.config import Settings
+from docspilot.redact import redact
 
 
 def _add_trace_ids(
@@ -22,6 +23,32 @@ def _add_trace_ids(
         event_dict["trace_id"] = format(ctx.trace_id, "032x")
         event_dict["span_id"] = format(ctx.span_id, "016x")
     return event_dict
+
+
+_STRUCTURAL = frozenset(
+    {"event", "level", "timestamp", "trace_id", "span_id", "request_id", "method", "path"}
+)
+
+
+def _redact_values(
+    _: Any, __: str, event_dict: MutableMapping[str, Any]
+) -> MutableMapping[str, Any]:
+    """Logs outlive requests and travel to third parties: scrub free-text values (error
+    details, queries, exception text) of emails, secrets, card/phone/IBAN numbers."""
+    for key, value in event_dict.items():
+        if key not in _STRUCTURAL:
+            event_dict[key] = _scrub(value)
+    return event_dict
+
+
+def _scrub(value: Any) -> Any:
+    if isinstance(value, str):
+        return redact(value)
+    if isinstance(value, list | tuple):
+        return [_scrub(v) for v in value]
+    if isinstance(value, dict):
+        return {k: _scrub(v) for k, v in value.items()}
+    return value
 
 
 def configure_logging(settings: Settings) -> None:
@@ -38,7 +65,13 @@ def configure_logging(settings: Settings) -> None:
         else structlog.dev.ConsoleRenderer()
     )
     structlog.configure(
-        processors=[*shared, structlog.processors.format_exc_info, renderer],
+        # exc_info is rendered to text *before* scrubbing so tracebacks are covered too
+        processors=[
+            *shared,
+            structlog.processors.format_exc_info,
+            _redact_values,
+            renderer,
+        ],
         wrapper_class=structlog.make_filtering_bound_logger(level),
         logger_factory=structlog.PrintLoggerFactory(file=sys.stdout),
         cache_logger_on_first_use=True,

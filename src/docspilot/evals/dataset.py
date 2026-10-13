@@ -13,6 +13,7 @@ Category = Literal[
     "contradiction",
     "unanswerable",
     "injection",
+    "adversarial",
     "ticket_intent",
     "smalltalk",
 ]

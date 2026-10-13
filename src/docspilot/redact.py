@@ -51,3 +51,7 @@ def redact(text: str) -> str:
         return "[phone]" if len(digits) >= 10 and re.search(r"\D", raw) else raw
 
     return _PHONE.sub(phone, text)
+
+
+def contains_secret(text: str) -> bool:
+    return _SECRET.search(text) is not None

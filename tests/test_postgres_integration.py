@@ -135,3 +135,28 @@ async def test_feedback_upsert_and_nul_safe(dsn: str) -> None:
             assert await cur.fetchone() == (-1, "wrong plan")
     finally:
         await pool.close()
+
+
+async def test_spend_store_add_is_atomic_and_returns_the_new_total(dsn: str) -> None:
+    import asyncio
+
+    from docspilot.budget import Budget, BudgetExceeded, PostgresSpendStore
+
+    pool = await create_pool(dsn)
+    try:
+        store = PostgresSpendStore(pool)
+        assert await store.spent_today("u1") == 0.0
+        assert await store.add("u1", 0.25) == pytest.approx(0.25)
+        assert await store.add("u1", 0.5) == pytest.approx(0.75)
+        assert await store.add("u1", -0.25) == pytest.approx(0.5)
+
+        # reservation race against the real database: only two 0.4 reservations fit under 1.0
+        budget = Budget(store, user_daily_usd=1.0, global_daily_usd=0, reserve_usd=0.4)
+        results = await asyncio.gather(
+            *(budget.reserve("racer") for _ in range(6)), return_exceptions=True
+        )
+        assert sum(not isinstance(r, BaseException) for r in results) == 2
+        assert all(isinstance(r, BudgetExceeded) for r in results if isinstance(r, BaseException))
+        assert await store.spent_today("racer") == pytest.approx(0.8)
+    finally:
+        await pool.close()

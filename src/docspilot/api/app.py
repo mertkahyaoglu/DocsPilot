@@ -17,8 +17,14 @@ from docspilot.agent.pending import InMemoryPendingStore
 from docspilot.api.chat import router as chat_router
 from docspilot.api.debug import router as debug_router
 from docspilot.api.feedback import router as feedback_router
-from docspilot.api.middleware import BodySizeLimitMiddleware, RequestContextMiddleware
+from docspilot.api.middleware import (
+    BodySizeLimitMiddleware,
+    RequestContextMiddleware,
+    SecurityHeadersMiddleware,
+)
 from docspilot.api.triage import router as triage_router
+from docspilot.auth import ApiKeyAuthenticator, parse_api_keys
+from docspilot.budget import Budget, InMemorySpendStore, PostgresSpendStore
 from docspilot.cache import CorpusVersionProvider, ResponseCache
 from docspilot.config import Settings, get_settings
 from docspilot.llm.client import AnthropicLLM, build_anthropic_client
@@ -28,6 +34,7 @@ from docspilot.llm.types import LLM
 from docspilot.logging import configure_logging, get_logger
 from docspilot.prompts import PromptRegistry
 from docspilot.rag.factory import build_rag
+from docspilot.ratelimit import RateLimiter
 from docspilot.telemetry import Metrics, Telemetry, setup_tracing
 
 
@@ -76,6 +83,25 @@ def create_app(
             rag = await stack.enter_async_context(build_rag(settings))
             app.state.rag = rag
             app.state.tickets = rag.tickets
+            app.state.authenticator = ApiKeyAuthenticator(
+                parse_api_keys(settings.api_keys.get_secret_value()) if settings.api_keys else {}
+            )
+            app.state.rate_limiter = RateLimiter(
+                per_minute=settings.rate_limit_per_min, burst=settings.rate_limit_burst
+            )
+            spend = PostgresSpendStore(rag.pool) if rag.pool else InMemorySpendStore()
+            app.state.budget = Budget(
+                spend,
+                user_daily_usd=settings.user_daily_budget_usd,
+                global_daily_usd=settings.global_daily_budget_usd,
+                reserve_usd=settings.budget_reserve_usd,
+            )
+            if not app.state.authenticator.required:
+                log.warning(
+                    "auth_disabled",
+                    note="DOCSPILOT_API_KEYS is unset: every caller is 'anonymous' (dev only)",
+                    env=settings.env,
+                )
             app.state.feedback = rag.feedback
             app.state.pending = InMemoryPendingStore(ttl_s=settings.confirmation_ttl_s)
             rag.retriever.attach_telemetry(telemetry)
@@ -103,16 +129,19 @@ def create_app(
             )
             yield
 
-    prod = settings.env == "prod"
+    prod = settings.strict
     app = FastAPI(
         title="DocsPilot",
         version=__version__,
         lifespan=lifespan,
-        docs_url=None if prod else "/docs",
+        # The strict CSP also blocks Swagger's CDN assets, so interactive docs are off;
+        # the schema itself is available outside strict environments.
+        docs_url=None,
         redoc_url=None,
-        openapi_url=None if prod else "/openapi.json",
+        openapi_url=None if settings.strict else "/openapi.json",
     )
     app.add_middleware(BodySizeLimitMiddleware, max_bytes=settings.max_body_bytes)
+    app.add_middleware(SecurityHeadersMiddleware)
     app.add_middleware(RequestContextMiddleware)  # outermost: sees every response, incl. 413
     app.include_router(chat_router)
     app.include_router(triage_router)
@@ -131,8 +160,8 @@ def create_app(
         @app.get("/metrics", include_in_schema=False)
         async def metrics(request: Request) -> Response:
             if token is not None:
-                supplied = request.headers.get("authorization", "")
-                if not secrets.compare_digest(supplied, f"Bearer {token}"):
+                supplied = request.headers.get("authorization", "").encode()
+                if not secrets.compare_digest(supplied, f"Bearer {token}".encode()):
                     return Response(status_code=401, headers={"WWW-Authenticate": "Bearer"})
             return Response(
                 generate_latest(app.state.telemetry.metrics.registry),

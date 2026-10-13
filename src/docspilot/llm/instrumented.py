@@ -10,9 +10,11 @@ from dataclasses import asdict
 
 from opentelemetry.trace import Status, StatusCode
 
+from docspilot.budget import current_meter
 from docspilot.llm.errors import LLMError
 from docspilot.llm.types import LLM, LLMEvent, LLMRequest, LLMResult, TextDelta
 from docspilot.logging import get_logger
+from docspilot.pricing import cost_or_ceiling
 from docspilot.telemetry import Telemetry, record_llm_usage
 
 log = get_logger("llm")
@@ -56,6 +58,9 @@ class InstrumentedLLM:
                     cost = record_llm_usage(
                         m, model=served, purpose=purpose, usage=event.usage, latency_s=latency
                     )
+                    meter = current_meter.get()
+                    if meter is not None:
+                        meter.usd += cost_or_ceiling(served, event.usage)
                     if event.served_by_fallback:
                         m.llm_fallback.labels(requested, served).inc()
                     u = event.usage

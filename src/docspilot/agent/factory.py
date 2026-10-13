@@ -23,7 +23,12 @@ def build_agent(
 ) -> Agent:
     return Agent(
         llm,
-        ToolRegistry(default_tools(retriever), telemetry=telemetry),
+        ToolRegistry(
+            default_tools(
+                retriever, injection_policy=settings.injection_policy, telemetry=telemetry
+            ),
+            telemetry=telemetry,
+        ),
         pending,
         AgentConfig(
             model=settings.model_answer,

@@ -87,6 +87,24 @@ class Metrics:
             "docspilot_cache_requests_total", "Response cache lookups", ["result"], registry=r
         )
         self.route = Counter("docspilot_route_total", "Routing decisions", ["route"], registry=r)
+        self.injection = Counter(
+            "docspilot_injection_suspected_total",
+            "Retrieved paragraphs flagged as injected instructions",
+            ["policy"],
+            registry=r,
+        )
+        self.output_blocked = Counter(
+            "docspilot_output_blocked_total",
+            "Answers withheld by the output guard",
+            ["reason"],
+            registry=r,
+        )
+        self.rejections = Counter(
+            "docspilot_rejections_total",
+            "Requests refused before work started",
+            ["reason"],  # unauthenticated | rate_limited | budget_user | budget_global
+            registry=r,
+        )
         self.llm_fallback = Counter(
             "docspilot_llm_fallback_total",
             "Calls rescued by the refusal-fallback model",

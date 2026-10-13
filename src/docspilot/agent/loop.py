@@ -38,6 +38,10 @@ from docspilot.logging import get_logger
 
 log = get_logger("agent")
 
+BLOCKED_WRITE = (
+    "This action is unavailable for the current request because retrieved content looked "
+    "unsafe. Do not retry. Tell the user you could not do it and suggest contacting support."
+)
 DECLINED = "The user declined this action. Do not retry it; acknowledge and offer alternatives."
 
 
@@ -303,6 +307,13 @@ class Agent:
                     retrieved[src.path] = src
                 yield ToolEnd(call.id, call.name, outcome.is_error, ms)
 
+            if awaiting and "suspected_injection" in ctx.flags:
+                # The model has read text that tried to instruct it. Whatever it now wants
+                # to *do* is suspect, so side effects are off for the rest of this turn.
+                for call_id in awaiting:
+                    outcomes[call_id] = ToolOutcome(BLOCKED_WRITE, True)
+                log.warning("write_blocked_tainted_turn", calls=len(awaiting))
+                awaiting = []
             if awaiting:
                 yield await self._pause(
                     messages, result, outcomes, awaiting, ctx, steps_left, usage, steps, retrieved

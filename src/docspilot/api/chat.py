@@ -5,7 +5,7 @@ import contextlib
 import json
 import re
 import time
-from collections.abc import AsyncGenerator, AsyncIterator
+from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable
 from dataclasses import asdict, dataclass
 from typing import Annotated, Any
 
@@ -24,8 +24,9 @@ from docspilot.agent.loop import (
 )
 from docspilot.agent.pending import PendingBusyError, PendingStore
 from docspilot.agent.tools import ToolContext
-from docspilot.api.deps import current_user_id
+from docspilot.api.deps import current_user_id, enforce_budget
 from docspilot.api.schemas import ChatRequest
+from docspilot.budget import Budget, CostMeter, current_meter
 from docspilot.cache import CachedAnswer, CorpusVersionProvider, ResponseCache, cache_key
 from docspilot.config import Settings
 from docspilot.llm.errors import LLMError
@@ -34,6 +35,7 @@ from docspilot.logging import get_logger
 from docspilot.pricing import cost_usd
 from docspilot.prompts import PromptRegistry
 from docspilot.routing import choose_route, smalltalk_events
+from docspilot.safety.output_guard import SAFE_MESSAGE, StreamingGuard, check_output
 from docspilot.telemetry import Telemetry
 from docspilot.tickets import TicketStore
 
@@ -52,6 +54,10 @@ _ERROR_STEPS = {
 }
 # Tools whose results are the same for every user: a turn that used only these is cacheable.
 _CACHEABLE_TOOLS = frozenset({"search_docs"})
+
+# Settlement must finish even when the client has gone: the task is shielded and kept
+# referenced here so it cannot be garbage collected mid-flight.
+_BACKGROUND: set[asyncio.Task[None]] = set()
 
 
 def _sse(event: str, data: dict[str, Any]) -> dict[str, str]:
@@ -78,6 +84,30 @@ class CacheSlot:
     allowed: bool = True
 
 
+def _strings(value: Any) -> list[str]:
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, dict):
+        return [s for v in value.values() for s in _strings(v)]
+    if isinstance(value, list | tuple):
+        return [s for v in value for s in _strings(v)]
+    return []
+
+
+async def _settle_detached(settle: Callable[[str], Awaitable[None]], outcome: str) -> None:
+    task = asyncio.ensure_future(settle(outcome))
+    _BACKGROUND.add(task)
+
+    def _done(t: asyncio.Task[None]) -> None:
+        _BACKGROUND.discard(t)
+        if not t.cancelled() and t.exception() is not None:
+            log.error("budget_settle_failed", error=repr(t.exception()))
+
+    task.add_done_callback(_done)
+    with contextlib.suppress(asyncio.CancelledError, Exception):
+        await asyncio.shield(task)  # we may be mid-cancellation; the task still finishes
+
+
 async def _to_sse(
     events: AsyncGenerator[AgentEvent, None],
     request_id: str,
@@ -85,12 +115,18 @@ async def _to_sse(
     *,
     cache: ResponseCache | None = None,
     slot: CacheSlot | None = None,
+    allowed_hosts: tuple[str, ...] | None = None,
+    settle: Callable[[str], Awaitable[None]] | None = None,
+    drop_pending: Callable[[str], Awaitable[None]] | None = None,
 ) -> AsyncIterator[dict[str, str]]:
     """Translate agent events to SSE. Always ends the stream with done|error.
 
     Tracing note: the root span is *not* held as the current context across `yield`
     (generators can be finalized from another task on disconnect). It is activated
-    around each step of the inner stream only, so child spans still parent correctly."""
+    around each step of the inner stream only, so child spans still parent correctly.
+
+    Safety note: text deltas pass through a StreamingGuard, so content that would be
+    blocked is never sent in the first place (a `replace` event only follows)."""
     m = tel.metrics
     started = time.perf_counter()
     outcome = "error"
@@ -98,9 +134,14 @@ async def _to_sse(
     tools: set[str] = set()
     search_ok = 0
     search_failed = 0
+    guard = StreamingGuard(allowed_hosts) if allowed_hosts else None
     root = tel.start("chat.request", **{"docspilot.request_id": request_id})
     m.in_flight.inc()
     it = events.__aiter__()
+
+    def flush_tail() -> str:
+        return guard.finish() if guard else ""
+
     try:
         while True:
             try:
@@ -110,9 +151,10 @@ async def _to_sse(
                 break
             if isinstance(event, TextDelta):
                 text += event.text
-                yield _sse("delta", {"text": event.text})
+                out = guard.feed(event.text) if guard else event.text
+                if out:
+                    yield _sse("delta", {"text": out})
             elif isinstance(event, StreamReset):
-                text = ""
                 yield _sse("reset", {})
             elif isinstance(event, ToolStart):
                 tools.add(event.name)
@@ -131,6 +173,25 @@ async def _to_sse(
                     },
                 )
             elif isinstance(event, NeedsConfirmation):
+                tail = flush_tail()
+                if tail:
+                    yield _sse("delta", {"text": tail})
+                # What the user is asked to approve is model-authored too: same checks.
+                args_text = "\n".join(s for i in event.items for s in _strings(i.arguments))
+                verdict = check_output(args_text, allowed_hosts) if allowed_hosts else None
+                if (guard and guard.blocked) or (verdict and not verdict.ok):
+                    outcome = "output_blocked"
+                    reasons = (guard.result.reasons if guard and guard.blocked else ()) + (
+                        verdict.reasons if verdict and not verdict.ok else ()
+                    )
+                    for reason in reasons:
+                        m.output_blocked.labels(reason.split(":")[0]).inc()
+                    log.warning("output_blocked", reasons=list(reasons), where="confirmation")
+                    if drop_pending is not None:
+                        await drop_pending(event.pending_id)
+                    yield _sse("replace", {"text": SAFE_MESSAGE})
+                    yield _sse("done", {"stop_reason": "output_blocked", "request_id": request_id})
+                    return
                 outcome = "awaiting_confirmation"
                 yield _sse(
                     "confirmation_required",
@@ -169,7 +230,27 @@ async def _to_sse(
                     flags=list(event.flags),
                     **asdict(event.usage),
                 )
-                if event.stop_reason == "refusal":
+                tail = flush_tail()
+                if tail:
+                    yield _sse("delta", {"text": tail})
+                if guard and guard.blocked:
+                    outcome = "output_blocked"
+                    for reason in guard.result.reasons:
+                        m.output_blocked.labels(reason.split(":")[0]).inc()
+                    log.warning("output_blocked", reasons=list(guard.result.reasons))
+                    yield _sse("replace", {"text": SAFE_MESSAGE})
+                    yield _sse(
+                        "done",
+                        {
+                            "stop_reason": "output_blocked",
+                            "usage": asdict(event.usage),
+                            "model": event.model,
+                            "steps": event.steps,
+                            "request_id": request_id,
+                            "cached": False,
+                        },
+                    )
+                elif event.stop_reason == "refusal":
                     outcome = "refusal"
                     yield _sse("error", _ERROR_REFUSAL)
                 elif event.stop_reason == "max_steps":
@@ -242,14 +323,18 @@ async def _to_sse(
         err = LLMError.from_unexpected(exc)
         yield _sse("error", {"code": err.kind, "retryable": False, "message": err.public_message})
     finally:
-        with contextlib.suppress(Exception):
-            await events.aclose()  # deterministic cleanup of the inner generators
+        # Synchronous bookkeeping first: it must survive any cancellation below.
         m.in_flight.dec()
         m.requests.labels(outcome).inc()
         root.set_attribute("docspilot.outcome", outcome)
         if outcome.startswith("error"):
             root.set_status(Status(StatusCode.ERROR, outcome))
         root.end()
+        with contextlib.suppress(BaseException):
+            await events.aclose()  # deterministic cleanup of the inner generators
+        if settle is not None:
+            # Spend is real even if the client left or the turn failed midway.
+            await _settle_detached(settle, outcome)
 
 
 @router.post("/chat")
@@ -263,10 +348,10 @@ async def chat(
     cache: ResponseCache = request.app.state.response_cache
     request_id: str = request.state.request_id
     _validate_limits(body, settings)
-    history = [m.model_dump() for m in body.messages]
     first_turn = len(body.messages) == 1
     question = body.messages[0].content
 
+    # A cache hit costs nothing, so it is served before any budget is reserved.
     slot: CacheSlot | None = None
     if cache.enabled and first_turn:
         versions: CorpusVersionProvider = request.app.state.corpus_versions
@@ -283,12 +368,42 @@ async def chat(
             return EventSourceResponse(_replay(hit, request_id, tel))
         slot = CacheSlot(key)
 
-    events: AsyncGenerator[AgentEvent, None]
-    if settings.routing and first_turn:
-        events = _routed(request, settings, question, history, user_id, tickets, tel, slot)
-    else:
-        events = agent.run(history, ToolContext(user_id=user_id, tickets=tickets))
-    return EventSourceResponse(_to_sse(events, request_id, tel, cache=cache, slot=slot))
+    reserved = await enforce_budget(request, user_id)
+    try:
+        meter = CostMeter()
+        current_meter.set(meter)  # InstrumentedLLM adds every model call of this request
+        budget: Budget = request.app.state.budget
+
+        async def settle(outcome: str) -> None:
+            await budget.settle(
+                user_id,
+                reserved,
+                meter.usd,
+                refund=outcome.startswith("error") and meter.usd == 0,
+            )
+
+        history = [m.model_dump() for m in body.messages]
+        events: AsyncGenerator[AgentEvent, None]
+        if settings.routing and first_turn:
+            events = _routed(request, settings, question, history, user_id, tickets, tel, slot)
+        else:
+            events = agent.run(history, ToolContext(user_id=user_id, tickets=tickets))
+        hosts = settings.allowed_host_list if settings.output_guard else None
+        return EventSourceResponse(
+            _to_sse(
+                events,
+                request_id,
+                tel,
+                cache=cache,
+                slot=slot,
+                allowed_hosts=hosts,
+                settle=settle,
+                drop_pending=request.app.state.pending.delete,
+            )
+        )
+    except BaseException:
+        await budget.settle(user_id, reserved, 0.0, refund=True)  # never leak a reservation
+        raise
 
 
 async def _replay(
@@ -371,6 +486,7 @@ async def confirm(
     store: PendingStore = request.app.state.pending
     tickets: TicketStore = request.app.state.tickets
     tel: Telemetry = request.app.state.telemetry
+    settings: Settings = request.app.state.settings
     # Exclusive claim: a double-click or concurrent retry cannot run the action twice.
     try:
         pending = await store.claim(body.pending_id, user_id=user_id)
@@ -378,8 +494,32 @@ async def confirm(
         raise HTTPException(409, "this confirmation is already being processed") from None
     if pending is None:
         raise HTTPException(404, "pending action not found or expired")
+    try:
+        reserved = await enforce_budget(request, user_id)
+    except BaseException:
+        await store.release(pending)  # over budget: the confirmation stays retryable
+        raise
+    meter = CostMeter()
+    current_meter.set(meter)
+    budget: Budget = request.app.state.budget
+
+    async def settle(outcome: str) -> None:
+        await budget.settle(
+            user_id, reserved, meter.usd, refund=outcome.startswith("error") and meter.usd == 0
+        )
+
     log.info("confirmation", approve=body.approve, tools=[c.name for c in pending.calls])
     events = agent.resume(
         pending, approve=body.approve, ctx=ToolContext(user_id=user_id, tickets=tickets)
     )
-    return EventSourceResponse(_to_sse(events, request.state.request_id, tel))
+    hosts = settings.allowed_host_list if settings.output_guard else None
+    return EventSourceResponse(
+        _to_sse(
+            events,
+            request.state.request_id,
+            tel,
+            allowed_hosts=hosts,
+            settle=settle,
+            drop_pending=store.delete,
+        )
+    )

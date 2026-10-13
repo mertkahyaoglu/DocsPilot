@@ -5,7 +5,12 @@ from pydantic import ValidationError
 
 from docspilot.config import Settings
 
-PROD = {"env": "prod", "database_url": "postgresql://x/y", "_env_file": None}
+PROD = {
+    "env": "prod",
+    "database_url": "postgresql://x/y",
+    "api_keys": "alice:alice-secret-key-0001",
+    "_env_file": None,
+}
 
 
 def test_prod_requires_api_key(monkeypatch: pytest.MonkeyPatch) -> None:

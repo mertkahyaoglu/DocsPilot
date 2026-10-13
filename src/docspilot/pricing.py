@@ -40,3 +40,18 @@ def cost_usd(model: str, usage: Usage) -> float | None:
         + usage.cache_creation_input_tokens * price.input * CACHE_WRITE_MULT
         + usage.output_tokens * price.output
     ) / per_m
+
+
+def cost_or_ceiling(model: str, usage: Usage) -> float:
+    """For *limits*: an unpriced model is charged at the most expensive known rate, so a
+    new model id can never be a way around a budget."""
+    exact = cost_usd(model, usage)
+    if exact is not None:
+        return exact
+    worst = max(PRICES.values(), key=lambda p: p.input + p.output)
+    per_m = 1_000_000
+    return (
+        (usage.input_tokens + usage.cache_read_input_tokens + usage.cache_creation_input_tokens)
+        * worst.input
+        + usage.output_tokens * worst.output
+    ) / per_m

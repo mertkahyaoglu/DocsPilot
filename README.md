@@ -29,7 +29,7 @@ docker compose -f docker-compose.yml -f docker-compose.observability.yml up -d  
 | 3 | RAG: chunking, pgvector hybrid search, rerank, citations | ✅ |
 | 4 | Evals: retrieval metrics, judge + calibration, CI gate, feedback | ✅ |
 | 5 | Observability & cost: OTel traces, Prometheus, caching, routing | ✅ |
-| 6 | Safety, guardrails | ⏳ |
+| 6 | Safety: injection defence, output guard, auth, limits, budgets | ✅ |
 | 7 | Ship | ⏳ |
 | 8 | Multi-agent, MCP, scaling, fine-tuning, OIDC | ⏳ |
 
