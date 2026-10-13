@@ -41,7 +41,7 @@ jobs:
     needs: check
     steps:
       - uses: actions/checkout@v4
-      - name: build and start the stack (fake model: no secrets needed)
+      - name: "build and start the stack (fake model, no secrets needed)"
         env:
           DOCSPILOT_LLM_BACKEND: fake
           GIT_SHA: ${{ github.sha }}
