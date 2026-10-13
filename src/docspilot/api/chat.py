@@ -5,7 +5,7 @@ import contextlib
 import json
 import re
 import time
-from collections.abc import AsyncGenerator, AsyncIterator
+from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable
 from dataclasses import asdict, dataclass
 from typing import Annotated, Any
 
@@ -24,8 +24,9 @@ from docspilot.agent.loop import (
 )
 from docspilot.agent.pending import PendingBusyError, PendingStore
 from docspilot.agent.tools import ToolContext
-from docspilot.api.deps import current_user_id
+from docspilot.api.deps import current_user_id, enforce_budget
 from docspilot.api.schemas import ChatRequest
+from docspilot.budget import Budget, CostMeter, current_meter
 from docspilot.cache import CachedAnswer, CorpusVersionProvider, ResponseCache, cache_key
 from docspilot.config import Settings
 from docspilot.llm.errors import LLMError
@@ -34,6 +35,7 @@ from docspilot.logging import get_logger
 from docspilot.pricing import cost_usd
 from docspilot.prompts import PromptRegistry
 from docspilot.routing import choose_route, smalltalk_events
+from docspilot.safety.output_guard import SAFE_MESSAGE, GuardResult, check_output
 from docspilot.telemetry import Telemetry
 from docspilot.tickets import TicketStore
 
@@ -85,6 +87,8 @@ async def _to_sse(
     *,
     cache: ResponseCache | None = None,
     slot: CacheSlot | None = None,
+    guard: Callable[[str], GuardResult] | None = None,
+    settle: Callable[[], Awaitable[None]] | None = None,
 ) -> AsyncIterator[dict[str, str]]:
     """Translate agent events to SSE. Always ends the stream with done|error.
 
@@ -175,6 +179,24 @@ async def _to_sse(
                 elif event.stop_reason == "max_steps":
                     outcome = "step_limit"
                     yield _sse("error", _ERROR_STEPS)
+                elif (verdict := guard(text) if guard else None) and not verdict.ok:
+                    # Everything the user has been shown is checked, not just the last step.
+                    outcome = "output_blocked"
+                    for reason in verdict.reasons:
+                        m.output_blocked.labels(reason.split(":")[0]).inc()
+                    log.warning("output_blocked", reasons=list(verdict.reasons))
+                    yield _sse("replace", {"text": SAFE_MESSAGE})
+                    yield _sse(
+                        "done",
+                        {
+                            "stop_reason": "output_blocked",
+                            "usage": asdict(event.usage),
+                            "model": event.model,
+                            "steps": event.steps,
+                            "request_id": request_id,
+                            "cached": False,
+                        },
+                    )
                 else:
                     outcome = "ok"
                     citations = [
@@ -244,6 +266,12 @@ async def _to_sse(
     finally:
         with contextlib.suppress(Exception):
             await events.aclose()  # deterministic cleanup of the inner generators
+        if settle is not None:
+            # Spend is real even if the client left or the turn failed midway.
+            try:
+                await settle()
+            except Exception:
+                log.exception("budget_settle_failed")
         m.in_flight.dec()
         m.requests.labels(outcome).inc()
         root.set_attribute("docspilot.outcome", outcome)
@@ -263,6 +291,15 @@ async def chat(
     cache: ResponseCache = request.app.state.response_cache
     request_id: str = request.state.request_id
     _validate_limits(body, settings)
+    await enforce_budget(request, user_id)
+    meter = CostMeter()
+    current_meter.set(meter)  # InstrumentedLLM adds every model call of this request
+    budget: Budget = request.app.state.budget
+
+    async def settle() -> None:
+        await budget.record(user_id, meter.usd)
+
+    guard = _guard_for(settings)
     history = [m.model_dump() for m in body.messages]
     first_turn = len(body.messages) == 1
     question = body.messages[0].content
@@ -288,7 +325,16 @@ async def chat(
         events = _routed(request, settings, question, history, user_id, tickets, tel, slot)
     else:
         events = agent.run(history, ToolContext(user_id=user_id, tickets=tickets))
-    return EventSourceResponse(_to_sse(events, request_id, tel, cache=cache, slot=slot))
+    return EventSourceResponse(
+        _to_sse(events, request_id, tel, cache=cache, slot=slot, guard=guard, settle=settle)
+    )
+
+
+def _guard_for(settings: Settings) -> Callable[[str], GuardResult] | None:
+    if not settings.output_guard:
+        return None
+    hosts = settings.allowed_host_list
+    return lambda text: check_output(text, hosts)
 
 
 async def _replay(
@@ -371,6 +417,15 @@ async def confirm(
     store: PendingStore = request.app.state.pending
     tickets: TicketStore = request.app.state.tickets
     tel: Telemetry = request.app.state.telemetry
+    settings: Settings = request.app.state.settings
+    await enforce_budget(request, user_id)
+    meter = CostMeter()
+    current_meter.set(meter)
+    budget: Budget = request.app.state.budget
+
+    async def settle() -> None:
+        await budget.record(user_id, meter.usd)
+
     # Exclusive claim: a double-click or concurrent retry cannot run the action twice.
     try:
         pending = await store.claim(body.pending_id, user_id=user_id)
@@ -382,4 +437,6 @@ async def confirm(
     events = agent.resume(
         pending, approve=body.approve, ctx=ToolContext(user_id=user_id, tickets=tickets)
     )
-    return EventSourceResponse(_to_sse(events, request.state.request_id, tel))
+    return EventSourceResponse(
+        _to_sse(events, request.state.request_id, tel, guard=_guard_for(settings), settle=settle)
+    )

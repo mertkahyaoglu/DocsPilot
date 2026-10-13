@@ -17,8 +17,14 @@ from docspilot.agent.pending import InMemoryPendingStore
 from docspilot.api.chat import router as chat_router
 from docspilot.api.debug import router as debug_router
 from docspilot.api.feedback import router as feedback_router
-from docspilot.api.middleware import BodySizeLimitMiddleware, RequestContextMiddleware
+from docspilot.api.middleware import (
+    BodySizeLimitMiddleware,
+    RequestContextMiddleware,
+    SecurityHeadersMiddleware,
+)
 from docspilot.api.triage import router as triage_router
+from docspilot.auth import ApiKeyAuthenticator, parse_api_keys
+from docspilot.budget import Budget, InMemorySpendStore, PostgresSpendStore
 from docspilot.cache import CorpusVersionProvider, ResponseCache
 from docspilot.config import Settings, get_settings
 from docspilot.llm.client import AnthropicLLM, build_anthropic_client
@@ -28,6 +34,7 @@ from docspilot.llm.types import LLM
 from docspilot.logging import configure_logging, get_logger
 from docspilot.prompts import PromptRegistry
 from docspilot.rag.factory import build_rag
+from docspilot.ratelimit import RateLimiter
 from docspilot.telemetry import Metrics, Telemetry, setup_tracing
 
 
@@ -76,6 +83,18 @@ def create_app(
             rag = await stack.enter_async_context(build_rag(settings))
             app.state.rag = rag
             app.state.tickets = rag.tickets
+            app.state.authenticator = ApiKeyAuthenticator(
+                parse_api_keys(settings.api_keys.get_secret_value()) if settings.api_keys else {}
+            )
+            app.state.rate_limiter = RateLimiter(
+                per_minute=settings.rate_limit_per_min, burst=settings.rate_limit_burst
+            )
+            spend = PostgresSpendStore(rag.pool) if rag.pool else InMemorySpendStore()
+            app.state.budget = Budget(
+                spend,
+                user_daily_usd=settings.user_daily_budget_usd,
+                global_daily_usd=settings.global_daily_budget_usd,
+            )
             app.state.feedback = rag.feedback
             app.state.pending = InMemoryPendingStore(ttl_s=settings.confirmation_ttl_s)
             rag.retriever.attach_telemetry(telemetry)
@@ -113,6 +132,7 @@ def create_app(
         openapi_url=None if prod else "/openapi.json",
     )
     app.add_middleware(BodySizeLimitMiddleware, max_bytes=settings.max_body_bytes)
+    app.add_middleware(SecurityHeadersMiddleware)
     app.add_middleware(RequestContextMiddleware)  # outermost: sees every response, incl. 413
     app.include_router(chat_router)
     app.include_router(triage_router)

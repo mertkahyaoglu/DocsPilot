@@ -102,3 +102,38 @@ class RequestContextMiddleware:
                 status=status,
                 duration_ms=round((time.perf_counter() - started) * 1000, 1),
             )
+
+
+_CSP = (
+    "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; "
+    "connect-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'"
+)
+_SECURITY_HEADERS = [
+    (b"content-security-policy", _CSP.encode()),
+    (b"x-content-type-options", b"nosniff"),
+    (b"referrer-policy", b"no-referrer"),
+    (b"x-frame-options", b"DENY"),
+    (b"cache-control", b"no-store"),
+]
+
+
+class SecurityHeadersMiddleware:
+    """Defence in depth for the bundled UI: even if a response were ever to carry model
+    output as HTML, the CSP forbids inline script and third-party loads."""
+
+    def __init__(self, app: ASGIApp) -> None:
+        self.app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        async def send_wrapper(message: Message) -> None:
+            if message["type"] == "http.response.start":
+                existing = {k.lower() for k, _ in message.get("headers", [])}
+                headers = message.setdefault("headers", [])
+                headers.extend(h for h in _SECURITY_HEADERS if h[0] not in existing)
+            await send(message)
+
+        await self.app(scope, receive, send_wrapper)

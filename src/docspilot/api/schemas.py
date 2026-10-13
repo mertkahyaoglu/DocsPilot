@@ -3,13 +3,23 @@ from __future__ import annotations
 import itertools
 from typing import Literal
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
+
+from docspilot.safety.sanitize import clean_user_text
 
 
 class ChatMessage(BaseModel):
     role: Literal["user", "assistant"]
     # Hard upper bound; the configured (lower) limit is enforced in the route.
     content: str = Field(min_length=1, max_length=32_000)
+
+    @field_validator("content")
+    @classmethod
+    def _clean(cls, v: str) -> str:
+        cleaned = clean_user_text(v)
+        if not cleaned:
+            raise ValueError("message is empty after removing control characters")
+        return cleaned
 
 
 class ChatRequest(BaseModel):

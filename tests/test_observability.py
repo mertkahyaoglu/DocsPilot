@@ -642,8 +642,9 @@ def test_metrics_route_is_absent_in_prod_without_a_token(
         cfg = Settings(
             env="prod",
             database_url="postgresql://x/y",
+            api_keys="alice:alice-secret-key-0001",  # type: ignore[arg-type]
             _env_file=None,
-            **kw,  # type: ignore[arg-type]
+            **kw,
         )
         return {getattr(r, "path", "") for r in create_app(cfg, FakeLLM()).routes}
 

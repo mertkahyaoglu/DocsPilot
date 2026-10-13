@@ -135,3 +135,19 @@ async def test_feedback_upsert_and_nul_safe(dsn: str) -> None:
             assert await cur.fetchone() == (-1, "wrong plan")
     finally:
         await pool.close()
+
+
+async def test_spend_store_accumulates_per_user_and_globally(dsn: str) -> None:
+    from docspilot.budget import GLOBAL_KEY, PostgresSpendStore
+
+    pool = await create_pool(dsn)
+    try:
+        store = PostgresSpendStore(pool)
+        assert await store.spent_today("u1") == 0.0
+        await store.add("u1", 0.25)
+        await store.add("u1", 0.50)
+        await store.add("u2", 1.0)
+        assert await store.spent_today("u1") == pytest.approx(0.75)
+        assert await store.spent_today(GLOBAL_KEY) == pytest.approx(1.75)
+    finally:
+        await pool.close()

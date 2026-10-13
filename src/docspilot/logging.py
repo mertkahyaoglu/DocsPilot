@@ -12,6 +12,7 @@ from opentelemetry import trace
 from structlog.typing import Processor
 
 from docspilot.config import Settings
+from docspilot.redact import redact
 
 
 def _add_trace_ids(
@@ -24,11 +25,28 @@ def _add_trace_ids(
     return event_dict
 
 
+_STRUCTURAL = frozenset(
+    {"event", "level", "timestamp", "trace_id", "span_id", "request_id", "method", "path"}
+)
+
+
+def _redact_values(
+    _: Any, __: str, event_dict: MutableMapping[str, Any]
+) -> MutableMapping[str, Any]:
+    """Logs outlive requests and travel to third parties: scrub free-text values (error
+    details, queries, exception text) of emails, secrets, card/phone/IBAN numbers."""
+    for key, value in event_dict.items():
+        if key not in _STRUCTURAL and isinstance(value, str):
+            event_dict[key] = redact(value)
+    return event_dict
+
+
 def configure_logging(settings: Settings) -> None:
     level = logging.getLevelName(settings.log_level.upper())
     shared: list[Processor] = [
         structlog.contextvars.merge_contextvars,
         _add_trace_ids,
+        _redact_values,
         structlog.processors.add_log_level,
         structlog.processors.TimeStamper(fmt="iso", utc=True),
     ]

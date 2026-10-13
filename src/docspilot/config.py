@@ -37,6 +37,18 @@ class Settings(BaseSettings):
     # "fake" = canned offline replies (UI demos / no API key). Never allowed in prod.
     llm_backend: Literal["anthropic", "fake"] = "anthropic"
 
+    # --- safety ---
+    #: "user:key,user2:key2" (keys >= 16 chars). Required in prod; unset in dev = anonymous.
+    api_keys: SecretStr | None = Field(default=None, validation_alias="DOCSPILOT_API_KEYS")
+    injection_policy: Literal["off", "annotate", "redact"] = "redact"
+    #: Hosts the answer may link to / mention (subdomains included), comma separated.
+    allowed_hosts: str = "acmebilling.example"
+    output_guard: bool = True
+    rate_limit_per_min: float = Field(default=30.0, ge=0)  # 0 disables
+    rate_limit_burst: float = Field(default=10.0, ge=1)
+    user_daily_budget_usd: float = Field(default=5.0, ge=0)  # 0 disables
+    global_daily_budget_usd: float = Field(default=100.0, ge=0)
+
     # --- observability ---
     otlp_endpoint: str | None = Field(default=None, validation_alias="OTEL_EXPORTER_OTLP_ENDPOINT")
     otlp_headers: str | None = Field(default=None, validation_alias="OTEL_EXPORTER_OTLP_HEADERS")
@@ -92,6 +104,10 @@ class Settings(BaseSettings):
     max_body_bytes: int = Field(default=256 * 1024, ge=1024)
 
     @property
+    def allowed_host_list(self) -> tuple[str, ...]:
+        return tuple(h.strip().lower() for h in self.allowed_hosts.split(",") if h.strip())
+
+    @property
     def resolved_embedder(self) -> Literal["voyage", "hash"]:
         if self.embedder == "auto":
             return "voyage" if self.voyage_api_key else "hash"
@@ -109,6 +125,7 @@ class Settings(BaseSettings):
         "database_url",
         "otlp_endpoint",
         "metrics_token",
+        "api_keys",
         mode="before",
     )
     @classmethod
@@ -128,6 +145,10 @@ class Settings(BaseSettings):
             raise ValueError("DATABASE_URL is required when DOCSPILOT_ENV=prod")
         if self.env == "prod" and self.resolved_embedder == "hash":
             raise ValueError("a real embedder (VOYAGE_API_KEY) is required in prod")
+        if self.env == "prod" and self.api_keys is None:
+            raise ValueError("DOCSPILOT_API_KEYS is required when DOCSPILOT_ENV=prod")
+        if self.env == "prod" and self.injection_policy == "off":
+            raise ValueError("DOCSPILOT_INJECTION_POLICY must not be 'off' in prod")
         if "voyage" in (self.embedder, self.rerank) and self.voyage_api_key is None:
             raise ValueError("VOYAGE_API_KEY is required for embedder/rerank=voyage")
         if self.rerank_min_score is not None and self.resolved_rerank == "none":

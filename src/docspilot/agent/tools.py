@@ -15,6 +15,8 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from docspilot.logging import get_logger
 from docspilot.rag.retrieve import Retriever
+from docspilot.safety.injection import Policy, neutralize
+from docspilot.safety.spotlight import new_nonce, unwrap, wrap
 from docspilot.telemetry import Telemetry
 from docspilot.tickets import Severity, TicketStore
 
@@ -31,6 +33,8 @@ class ToolContext:
     #: Per-request scratch set tools use to tell the caller about the turn
     #: ("degraded_retrieval"). Shared by reference across `with_key` copies.
     flags: set[str] = field(default_factory=set)
+    #: Random id on the untrusted-content delimiters of this request (spotlighting).
+    nonce: str = field(default_factory=new_nonce)
 
     def with_key(self, key: str) -> ToolContext:
         return replace(self, idempotency_key=key)
@@ -258,8 +262,16 @@ class SearchDocsTool(Tool):
     #: below MAX_TOOL_OUTPUT_CHARS so the generic backstop never triggers.
     char_budget = 7000
 
-    def __init__(self, retriever: Retriever) -> None:
+    def __init__(
+        self,
+        retriever: Retriever,
+        *,
+        policy: Policy = "redact",
+        telemetry: Telemetry | None = None,
+    ) -> None:
         self._retriever = retriever
+        self._policy = policy
+        self._tel = telemetry or Telemetry.noop()
 
     async def run(self, args: SearchDocsInput, ctx: ToolContext) -> dict[str, Any]:
         result = await self._retriever.search(args.query)
@@ -268,17 +280,32 @@ class SearchDocsTool(Tool):
         results: list[dict[str, Any]] = []
         for hit in result.hits:  # best first: when the budget runs out the tail is dropped
             c = hit.chunk
+            # Retrieved text is untrusted input to the model. Scan it, neutralise what
+            # looks like instructions, then mark it as data with unforgeable delimiters.
+            text, findings = neutralize(c.text, self._policy)
+            if findings:
+                self._tel.metrics.injection.labels(self._policy).inc(len(findings))
+                log.warning(
+                    "injection_suspected",
+                    path=c.path,
+                    policy=self._policy,
+                    categories=sorted({cat for f in findings for cat in f.categories}),
+                )
+                # If the model will still *see* the text, the turn is tainted.
+                ctx.flags.add(
+                    "injection_removed" if self._policy == "redact" else "suspected_injection"
+                )
             item = {
                 "source": c.path,
                 "title": c.title,
                 "section": c.heading_path,
                 "updated": c.updated.isoformat() if c.updated else None,
-                "text": c.text,
+                "text": wrap(text, ctx.nonce),
             }
             if len(json.dumps([*results, item], ensure_ascii=False)) > self.char_budget:
                 if not results:  # even the best chunk alone is too big: shorten its text
-                    room = self.char_budget - len(json.dumps({**item, "text": ""})) - 40
-                    item["text"] = c.text[: max(room, 200)] + " …[truncated]"
+                    room = self.char_budget - len(json.dumps({**item, "text": ""})) - 120
+                    item["text"] = wrap(text[: max(room, 200)] + " …[truncated]", ctx.nonce)
                     results.append(item)
                 break
             results.append(item)
@@ -288,13 +315,20 @@ class SearchDocsTool(Tool):
 
     def sources(self, output: dict[str, Any]) -> tuple[Source, ...]:
         return tuple(
-            Source(r["source"], r["title"], r["section"], r.get("text", ""), r.get("updated"))
+            Source(
+                r["source"], r["title"], r["section"], unwrap(r.get("text", "")), r.get("updated")
+            )
             for r in output.get("results", [])
         )
 
 
-def default_tools(retriever: Retriever | None = None) -> list[Tool]:
+def default_tools(
+    retriever: Retriever | None = None,
+    *,
+    injection_policy: Policy = "redact",
+    telemetry: Telemetry | None = None,
+) -> list[Tool]:
     tools: list[Tool] = [CreateTicketTool(), GetTicketTool()]
     if retriever is not None:
-        tools.append(SearchDocsTool(retriever))
+        tools.append(SearchDocsTool(retriever, policy=injection_policy, telemetry=telemetry))
     return tools
