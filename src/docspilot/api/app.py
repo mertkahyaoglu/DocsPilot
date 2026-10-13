@@ -8,11 +8,11 @@ from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from docspilot import __version__
-from docspilot.agent.loop import Agent, AgentConfig
+from docspilot.agent.factory import build_agent
 from docspilot.agent.pending import InMemoryPendingStore
-from docspilot.agent.tools import ToolRegistry, default_tools
 from docspilot.api.chat import router as chat_router
 from docspilot.api.debug import router as debug_router
+from docspilot.api.feedback import router as feedback_router
 from docspilot.api.middleware import BodySizeLimitMiddleware, RequestContextMiddleware
 from docspilot.api.triage import router as triage_router
 from docspilot.config import Settings, get_settings
@@ -52,22 +52,14 @@ def create_app(settings: Settings | None = None, llm: LLM | None = None) -> Fast
             rag = await stack.enter_async_context(build_rag(settings))
             app.state.rag = rag
             app.state.tickets = rag.tickets
+            app.state.feedback = rag.feedback
             app.state.pending = InMemoryPendingStore(ttl_s=settings.confirmation_ttl_s)
-            app.state.agent = Agent(
-                app.state.llm,
-                ToolRegistry(default_tools(rag.retriever)),
-                app.state.pending,
-                AgentConfig(
-                    model=settings.model_answer,
-                    system=answer_prompt.text,
-                    max_tokens=settings.max_tokens,
-                    effort=settings.effort_answer,
-                    max_steps=settings.max_agent_steps,
-                    tool_timeout_s=settings.tool_timeout_s,
-                    prompt_ref=answer_prompt.ref,
-                    prompt_sha=answer_prompt.sha,
-                ),
-                confirmation_ttl_s=settings.confirmation_ttl_s,
+            app.state.agent = build_agent(
+                settings,
+                llm=app.state.llm,
+                retriever=rag.retriever,
+                pending=app.state.pending,
+                answer_prompt=answer_prompt,
             )
             log.info(
                 "startup",
@@ -94,6 +86,7 @@ def create_app(settings: Settings | None = None, llm: LLM | None = None) -> Fast
     app.add_middleware(RequestContextMiddleware)  # outermost: sees every response, incl. 413
     app.include_router(chat_router)
     app.include_router(triage_router)
+    app.include_router(feedback_router)
     if not prod:
         app.include_router(debug_router)
 

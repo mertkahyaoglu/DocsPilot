@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from docspilot.config import Settings
+from docspilot.feedback import FeedbackStore, InMemoryFeedbackStore
 from docspilot.logging import get_logger
 from docspilot.rag.embeddings import Embedder, HashEmbedder, VoyageEmbedder
 from docspilot.rag.ingest import ingest_corpus
@@ -27,6 +28,7 @@ class RagStack:
     reranker: Reranker
     retriever: Retriever
     tickets: TicketStore
+    feedback: FeedbackStore
     pool: Any | None  # psycopg AsyncConnectionPool when Postgres-backed
 
 
@@ -59,8 +61,10 @@ async def build_rag(settings: Settings, *, ingest_on_start: bool = True) -> Asyn
         pool = None
         store: ChunkStore
         tickets: TicketStore
+        feedback: FeedbackStore
         if settings.database_url:
             from docspilot.db import apply_migrations, create_pool
+            from docspilot.feedback import PostgresFeedbackStore
             from docspilot.rag.pg_store import PostgresChunkStore
             from docspilot.tickets_pg import PostgresTicketStore
 
@@ -69,10 +73,12 @@ async def build_rag(settings: Settings, *, ingest_on_start: bool = True) -> Asyn
             stack.push_async_callback(pool.close)
             store = PostgresChunkStore(pool)
             tickets = PostgresTicketStore(pool)
+            feedback = PostgresFeedbackStore(pool)
         else:
             log.warning("using_in_memory_store", note="data is lost on restart")
             store = InMemoryChunkStore()
             tickets = InMemoryTicketStore()
+            feedback = InMemoryFeedbackStore()
 
         retriever = Retriever(
             store,
@@ -92,4 +98,4 @@ async def build_rag(settings: Settings, *, ingest_on_start: bool = True) -> Asyn
             # Always incremental: cheap when nothing changed, and it is what heals a
             # partially failed earlier ingest or an embedding-model switch.
             await ingest_corpus(settings.corpus_dir, store, embedder)
-        yield RagStack(store, embedder, reranker, retriever, tickets, pool)
+        yield RagStack(store, embedder, reranker, retriever, tickets, feedback, pool)

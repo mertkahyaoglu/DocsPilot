@@ -59,7 +59,9 @@ def _validate_limits(body: ChatRequest, settings: Settings) -> None:
             raise HTTPException(422, f"{m.role} message too long (max {limit} chars)")
 
 
-async def _to_sse(events: AsyncGenerator[AgentEvent, None]) -> AsyncIterator[dict[str, str]]:
+async def _to_sse(
+    events: AsyncGenerator[AgentEvent, None], request_id: str
+) -> AsyncIterator[dict[str, str]]:
     """Translate agent events to SSE. Always ends the stream with done|error."""
     try:
         async with aclosing(events) as stream:
@@ -92,7 +94,9 @@ async def _to_sse(events: AsyncGenerator[AgentEvent, None]) -> AsyncIterator[dic
                             ],
                         },
                     )
-                    yield _sse("done", {"stop_reason": "awaiting_confirmation"})
+                    yield _sse(
+                        "done", {"stop_reason": "awaiting_confirmation", "request_id": request_id}
+                    )
                     return
                 elif isinstance(event, AgentFinished):
                     if event.stop_reason == "refusal":
@@ -117,6 +121,7 @@ async def _to_sse(events: AsyncGenerator[AgentEvent, None]) -> AsyncIterator[dic
                                 "usage": asdict(event.usage),
                                 "model": event.model,
                                 "steps": event.steps,
+                                "request_id": request_id,
                             },
                         )
     except LLMError as exc:
@@ -147,7 +152,7 @@ async def chat(
     _validate_limits(body, settings)
     history = [m.model_dump() for m in body.messages]
     events = agent.run(history, ToolContext(user_id=user_id, tickets=tickets))
-    return EventSourceResponse(_to_sse(events))
+    return EventSourceResponse(_to_sse(events, request.state.request_id))
 
 
 class ConfirmRequest(BaseModel):
@@ -173,4 +178,4 @@ async def confirm(
     events = agent.resume(
         pending, approve=body.approve, ctx=ToolContext(user_id=user_id, tickets=tickets)
     )
-    return EventSourceResponse(_to_sse(events))
+    return EventSourceResponse(_to_sse(events, request.state.request_id))

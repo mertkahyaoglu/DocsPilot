@@ -33,3 +33,5 @@ jobs:
       - run: uv run ruff format --check .
       - run: uv run mypy src
       - run: uv run pytest
+      # Deterministic retrieval regression gate (hash embedder, no keys, no network).
+      - run: uv run python -m docspilot.evals retrieval --offline --check-baseline evals/baselines/retrieval-offline.json

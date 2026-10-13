@@ -15,6 +15,8 @@ make dev                    # http://localhost:8000 (reads .env)
 make dev-offline            # same UI, canned model replies, no API key needed
 make check                  # ruff + mypy + pytest (unit)
 make test-integration       # pgvector tests against `make db`
+make eval-retrieval         # offline retrieval metrics + regression gate
+make eval-answers           # end-to-end agent + LLM judge (needs keys, spends credits)
 ```
 
 ## Status
@@ -24,7 +26,7 @@ make test-integration       # pgvector tests against `make db`
 | 1 | Foundation: Claude client, streaming, prompts, config | ✅ |
 | 2 | Tool use, human confirmation, structured output | ✅ |
 | 3 | RAG: chunking, pgvector hybrid search, rerank, citations | ✅ |
-| 4 | Evals | ⏳ |
+| 4 | Evals: retrieval metrics, judge + calibration, CI gate, feedback | ✅ |
 | 5 | Observability, cost | ⏳ |
 | 6 | Safety, guardrails | ⏳ |
 | 7 | Ship | ⏳ |

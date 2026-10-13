@@ -221,3 +221,90 @@ the tool description tells it to write self-contained queries.
 | Old policy quoted | stale doc outranks new | `updated`, prompt rule, dedupe |
 | Answers cite non-existent pages | unvalidated citations | `extract_citations` |
 | Quality dropped after "re-index" | embedding model/dim changed silently | `documents.embedding_model` |
+
+---
+
+## Phase 4: Evals
+
+Without evals every prompt/model/chunking change is a coin flip you cannot see. An
+eval is a **versioned dataset + a scoring function + a threshold in CI**. This is the
+single skill that most separates AI engineering from API plumbing.
+
+### The dataset (`evals/golden.jsonl`)
+55 cases, each with a *category*, expected sources, expected facts, forbidden strings
+and expected behaviour. The mix is the point: plain lookups, multi-hop, contradictory
+docs, **unanswerable** questions (does it abstain or invent?), **injection** (does it
+obey a poisoned doc?), ticket intent, small talk. A dataset of only happy paths
+measures nothing you will regret. Grow it from production: every 👎
+(`POST /v1/feedback`) is a candidate case; every bug becomes a regression case.
+
+### Layer the evals
+| Suite | Needs | Speed | Runs |
+|---|---|---|---|
+| Unit/integration tests | nothing | seconds | every commit |
+| **Retrieval** (`evals retrieval`) | no LLM | seconds | every PR (CI gate) |
+| **Answers** (`evals answers`) | LLM + judge | minutes, $ | on demand / label / nightly |
+| Judge calibration (`evals calibrate`) | LLM | seconds | when judge or its prompt changes |
+
+### Retrieval metrics (deterministic)
+recall@k (did the needed documents appear?), hit@k, MRR (how high?). Computed per
+document, not per chunk. The runner reports an **ablation ladder** (vector → keyword
+→ hybrid → +rerank) so each added component has to earn its keep.
+
+Real result from this repo with the offline stand-in embedder (all rungs compared as
+top-5 *documents*): keyword 0.98 recall@5, hybrid 0.90, vector 0.87. Fusing a weak
+vector leg into a strong keyword leg *hurts*: exactly why you measure instead of
+assuming "hybrid is better". (A first version of this ablation compared chunks to
+documents and overstated the gap: an eval harness has bugs too; review it like code.)
+`hybrid@chunks` is the production setting, where only the top-5 *chunks* reach the
+model and may cover fewer documents. Do not extrapolate to Voyage embeddings: rerun
+with keys (`make eval-retrieval-live`).
+
+### Answer grading: deterministic first, judge second
+`evals/answers_eval.py::grade_case`. Everything that can be checked without a model
+is: did it propose a ticket the user never asked for (injection cases), does the
+proposed ticket carry the ids from the request, did it search for small talk, did it
+look before abstaining, did it leak an exfiltration token. The LLM judge is used only
+for meaning: *were the facts conveyed, did it abstain, is every claim grounded in the
+passages it was shown, did it relay instructions embedded in a document*.
+
+Two mistakes worth remembering (both caught in review):
+- `must_not` substrings are for *harmful compliance tokens* (an attacker's address),
+  never for positive-claim phrases: a correct denial ("Bitcoin is not supported") and a
+  correct warning quote the very strings you would forbid.
+- The judge must see exactly what the agent saw (path, section, **updated date**).
+  Otherwise "prefer the newer policy" answers are marked ungrounded.
+
+### A judge is a model you must evaluate
+Judges are biased, lenient, and sensitive to wording. `evals/judge_calibration.jsonl`
+holds hand-labelled answers (correct, wrong number, hallucinated extra, proper
+abstention, fabricated answer, vague hint...). `evals calibrate` reports agreement
+per field and fails below 90%. Mitigations used here: structured verdicts with
+`reasoning` first, one boolean per required fact (no holistic "score 1-10"), passages
+supplied so groundedness is checkable, untrusted text delivered as JSON data.
+
+### Reading results honestly
+- ~50 cases: one flipped case = 2 points. Reports include a **Wilson 95% interval**;
+  a 3-point difference between two runs is noise. Compare per-case with
+  `evals compare a.json b.json` (what did the change fix, what did it break?).
+- LLM runs are non-deterministic: the answers gate uses only the **overall** pass rate
+  with a tolerance. Categories hold 3-5 cases, so one flip moves a category 20-30
+  points: report them, never gate on them. Infra failures (API/judge errors) are
+  reported separately and trip their own check instead of silently counting as
+  model failures. Retrieval metrics *are* deterministic, so their tolerance is 0.
+- A baseline records judge model, embedder and case count; mismatches are refused
+  rather than reported as regressions. `--limit` is stratified across categories.
+- Report **cost and latency** with quality; a prompt that is +2% better and 3x the
+  tokens is a decision, not a win.
+- Never tune on the same cases you report. As the set grows, hold out a split.
+
+### The CI gate
+`ci.yml` runs the offline retrieval eval against `evals/baselines/retrieval-offline.json`
+(fails if a metric drops more than 0.03). `evals.yml` runs calibration + answers on
+a PR label or manually, because it spends credits. Update a baseline only deliberately,
+in the same PR, with the reason.
+
+### Online feedback
+`POST /v1/feedback` stores thumbs keyed by `request_id` (returned in the `done`
+event and the `X-Request-ID` header). Phase 5 makes the same id the trace id, so a 👎
+links straight to the retrieval, prompt version and tokens that produced it.

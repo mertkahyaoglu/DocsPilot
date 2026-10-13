@@ -117,3 +117,21 @@ async def test_ticket_store_idempotency_and_ownership(dsn: str) -> None:
         assert (await tickets.get(a.id, user_id="someone-else")) is None
     finally:
         await pool.close()
+
+
+async def test_feedback_upsert_and_nul_safe(dsn: str) -> None:
+    from docspilot.feedback import Feedback, PostgresFeedbackStore
+
+    pool = await create_pool(dsn)
+    try:
+        store = PostgresFeedbackStore(pool)
+        a = await store.add(Feedback("req-abcdef12", "u1", "up", ""))
+        b = await store.add(Feedback("req-abcdef12", "u1", "down", "wrong plan"))
+        assert a == b  # same row updated
+        c = await store.add(Feedback("req-abcdef12", "u2", "up", ""))
+        assert c != a
+        async with pool.connection() as conn:
+            cur = await conn.execute("SELECT rating, comment FROM feedback WHERE user_id = 'u1'")
+            assert await cur.fetchone() == (-1, "wrong plan")
+    finally:
+        await pool.close()

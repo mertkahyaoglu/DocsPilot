@@ -32,6 +32,7 @@
   .msg.confirm { border-color: var(--accent); }
   .msg.confirm pre { margin: 8px 0; padding: 8px; border-radius: 8px; font-size: 12px;
                      background: var(--bg); overflow-x: auto; white-space: pre-wrap; }
+  .thumb { background: none; border: 0; padding: 0 4px; font-size: 14px; cursor: pointer; }
   .row { display: flex; gap: 8px; }
   .row button { padding: 8px 14px; }
   button.secondary { background: transparent; color: var(--text); border: 1px solid var(--border); }
@@ -118,6 +119,22 @@ async function post(url, payload) {
   return res;
 }
 
+function feedbackButtons(requestId) {
+  const wrap = document.createElement("span");
+  for (const [label, rating] of [["👍", "up"], ["👎", "down"]]) {
+    const b = document.createElement("button");
+    b.type = "button"; b.textContent = label; b.className = "thumb";
+    b.setAttribute("aria-label", rating === "up" ? "Helpful" : "Not helpful");
+    b.addEventListener("click", async () => {
+      wrap.textContent = "Thanks for the feedback.";
+      try { await post("/v1/feedback", { request_id: requestId, rating }); }
+      catch { /* best effort */ }
+    });
+    wrap.appendChild(b);
+  }
+  return wrap;
+}
+
 // Render one streamed turn into `out`. Returns {answer, ok, pending}.
 async function consume(res, out) {
   const state = { answer: "", ok: false, pending: null, failed: false, stepStart: 0 };
@@ -156,7 +173,8 @@ async function consume(res, out) {
       state.ok = true;
       if (data.usage) {
         const m = document.createElement("div"); m.className = "meta";
-        m.textContent = `${data.model} · ${data.usage.input_tokens} in / ${data.usage.output_tokens} out`;
+        m.textContent = `${data.model} · ${data.usage.input_tokens} in / ${data.usage.output_tokens} out `;
+        if (data.request_id) m.appendChild(feedbackButtons(data.request_id));
         out.appendChild(m);
       }
     }

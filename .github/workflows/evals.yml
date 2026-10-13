@@ -1,0 +1,52 @@
+name: evals-live
+# Spends API credits (answers + judge for every golden case), so it is opt-in:
+# add the `run-evals` label to a PR (re-add it to re-run), or run it manually.
+on:
+  workflow_dispatch:
+  pull_request:
+    types: [labeled]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: evals-live-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  answers:
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.label.name == 'run-evals' &&
+       github.event.pull_request.head.repo.full_name == github.repository)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+      VOYAGE_API_KEY: ${{ secrets.VOYAGE_API_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      - run: uv sync --frozen
+      - name: require secrets
+        run: |
+          test -n "$ANTHROPIC_API_KEY" || { echo "ANTHROPIC_API_KEY secret missing"; exit 1; }
+          test -n "$VOYAGE_API_KEY" || { echo "VOYAGE_API_KEY secret missing (hash embedder would skew results)"; exit 1; }
+      - name: judge calibration (the judge must agree with humans before we trust it)
+        run: uv run python -m docspilot.evals calibrate
+      - name: answer evals
+        run: |
+          if [ -f evals/baselines/answers.json ]; then
+            uv run python -m docspilot.evals answers --concurrency 4 \
+              --out evals/results/answers.json --check-baseline evals/baselines/answers.json
+          else
+            echo "::notice::no evals/baselines/answers.json yet: results are informational"
+            uv run python -m docspilot.evals answers --concurrency 4 --out evals/results/answers.json
+          fi
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: eval-results
+          path: evals/results/

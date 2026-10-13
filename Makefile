@@ -1,4 +1,4 @@
-.PHONY: dev dev-offline test test-integration lint fmt typecheck check db ingest
+.PHONY: dev dev-offline test test-integration lint fmt typecheck check db ingest eval-retrieval eval-answers eval-calibrate
 
 dev:
 	uv run uvicorn --factory docspilot.api.app:create_app --reload --port 8000
@@ -29,3 +29,18 @@ typecheck:
 	uv run mypy src
 
 check: lint typecheck test
+
+# Deterministic, free, runs in CI.
+eval-retrieval:
+	uv run python -m docspilot.evals retrieval --offline --check-baseline evals/baselines/retrieval-offline.json
+
+# With keys in .env: real embeddings + rerank (no baseline check: different embedder).
+eval-retrieval-live:
+	uv run python -m docspilot.evals retrieval
+
+# Spends API credits.
+eval-answers:
+	uv run python -m docspilot.evals answers
+
+eval-calibrate:
+	uv run python -m docspilot.evals calibrate
