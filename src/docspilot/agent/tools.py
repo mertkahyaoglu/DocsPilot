@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, replace
 from typing import Any, ClassVar
@@ -14,6 +15,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from docspilot.logging import get_logger
 from docspilot.rag.retrieve import Retriever
+from docspilot.telemetry import Telemetry
 from docspilot.tickets import Severity, TicketStore
 
 log = get_logger("tools")
@@ -91,7 +93,8 @@ class Tool(ABC):
 
 
 class ToolRegistry:
-    def __init__(self, tools: list[Tool]) -> None:
+    def __init__(self, tools: list[Tool], telemetry: Telemetry | None = None) -> None:
+        self._tel = telemetry or Telemetry.noop()
         names = [t.name for t in tools]
         if len(set(names)) != len(names):
             raise ValueError("duplicate tool names")
@@ -118,6 +121,19 @@ class ToolRegistry:
             return ToolOutcome(f"Invalid arguments for {name}: {problems}", True)
 
     async def execute(
+        self, tool: Tool, args: ToolInput, ctx: ToolContext, *, timeout_s: float
+    ) -> ToolOutcome:
+        started = time.perf_counter()
+        with self._tel.span(f"tool.{tool.name}", **{"docspilot.tool": tool.name}) as span:
+            outcome = await self._execute(tool, args, ctx, timeout_s=timeout_s)
+            span.set_attribute("docspilot.tool.is_error", outcome.is_error)
+            span.set_attribute("docspilot.tool.sources", len(outcome.sources))
+        m = self._tel.metrics
+        m.tool_calls.labels(tool.name, "error" if outcome.is_error else "ok").inc()
+        m.tool_latency.labels(tool.name).observe(time.perf_counter() - started)
+        return outcome
+
+    async def _execute(
         self, tool: Tool, args: ToolInput, ctx: ToolContext, *, timeout_s: float
     ) -> ToolOutcome:
         try:

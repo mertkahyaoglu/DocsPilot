@@ -37,6 +37,19 @@ class Settings(BaseSettings):
     # "fake" = canned offline replies (UI demos / no API key). Never allowed in prod.
     llm_backend: Literal["anthropic", "fake"] = "anthropic"
 
+    # --- observability ---
+    otlp_endpoint: str | None = Field(default=None, validation_alias="OTEL_EXPORTER_OTLP_ENDPOINT")
+    otlp_headers: str | None = Field(default=None, validation_alias="OTEL_EXPORTER_OTLP_HEADERS")
+    service_name: str = "docspilot"
+    trace_content: bool = False  # prompts/answers in traces: redacted + truncated, opt-in
+    metrics_enabled: bool = True
+
+    # --- cost controls ---
+    prompt_caching: bool = True
+    response_cache_ttl_s: int = Field(default=3600, ge=0)  # 0 disables
+    response_cache_max_items: int = Field(default=500, ge=1)
+    routing: bool = False  # small-model triage in front of the agent (see LEARN.md)
+
     # --- storage & retrieval ---
     database_url: str | None = Field(default=None, validation_alias="DATABASE_URL")
     migrations_dir: Path = PROJECT_ROOT / "migrations"
@@ -88,7 +101,9 @@ class Settings(BaseSettings):
             return "voyage" if self.voyage_api_key else "none"
         return self.rerank
 
-    @field_validator("anthropic_api_key", "voyage_api_key", "database_url", mode="before")
+    @field_validator(
+        "anthropic_api_key", "voyage_api_key", "database_url", "otlp_endpoint", mode="before"
+    )
     @classmethod
     def _blank_key_is_none(cls, v: object) -> object:
         # `.env.example` ships `ANTHROPIC_API_KEY=`: blank must not satisfy fail-fast.

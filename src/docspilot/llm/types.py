@@ -44,6 +44,11 @@ class LLMRequest:
     # JSON schema for structured output (output_config.format). Mutually exclusive in spirit
     # with free text: the first text block is then guaranteed to be valid JSON.
     json_schema: dict[str, Any] | None = None
+    #: Cache the stable prefix (tools + system + history so far). Render order is
+    #: tools -> system -> messages, so anything volatile must come *after* it.
+    cache: bool = False
+    #: Why this call exists (answer | triage | judge | route): a metrics/trace label.
+    purpose: str = "answer"
 
 
 @dataclass(frozen=True, slots=True)

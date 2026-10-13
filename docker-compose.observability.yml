@@ -1,0 +1,21 @@
+# Local tracing + metrics:
+#   docker compose -f docker-compose.yml -f docker-compose.observability.yml up -d
+#   export OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:4318
+#   make dev   ->   Jaeger UI http://localhost:16686   Prometheus http://localhost:9090
+services:
+  jaeger:
+    image: jaegertracing/all-in-one:1.62.0
+    environment:
+      COLLECTOR_OTLP_ENABLED: "true"
+    ports:
+      - "127.0.0.1:16686:16686"   # UI
+      - "127.0.0.1:4318:4318"     # OTLP/HTTP
+
+  prometheus:
+    image: prom/prometheus:v2.55.1
+    volumes:
+      - ./ops/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    ports:
+      - "127.0.0.1:9090:9090"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"

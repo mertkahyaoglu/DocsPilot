@@ -4,17 +4,31 @@ from __future__ import annotations
 
 import logging
 import sys
+from collections.abc import MutableMapping
+from typing import Any
 
 import structlog
+from opentelemetry import trace
 from structlog.typing import Processor
 
 from docspilot.config import Settings
+
+
+def _add_trace_ids(
+    _: Any, __: str, event_dict: MutableMapping[str, Any]
+) -> MutableMapping[str, Any]:
+    ctx = trace.get_current_span().get_span_context()
+    if ctx.is_valid:
+        event_dict["trace_id"] = format(ctx.trace_id, "032x")
+        event_dict["span_id"] = format(ctx.span_id, "016x")
+    return event_dict
 
 
 def configure_logging(settings: Settings) -> None:
     level = logging.getLevelName(settings.log_level.upper())
     shared: list[Processor] = [
         structlog.contextvars.merge_contextvars,
+        _add_trace_ids,
         structlog.processors.add_log_level,
         structlog.processors.TimeStamper(fmt="iso", utc=True),
     ]

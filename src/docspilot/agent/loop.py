@@ -113,6 +113,7 @@ class AgentConfig:
     effort: Effort | None = None
     max_steps: int = 6
     tool_timeout_s: float = 15.0
+    prompt_caching: bool = False
     prompt_ref: str = ""  # for logs/traces only
     prompt_sha: str = ""
 
@@ -244,6 +245,8 @@ class Agent:
                 tools=self._registry.specs() or None,
                 max_tokens=cfg.max_tokens,
                 effort=cfg.effort,
+                cache=cfg.prompt_caching,
+                purpose="answer",
             )
             result: LLMResult | None = None
             async with aclosing(self._llm.stream(request)) as llm_stream:
@@ -254,21 +257,6 @@ class Agent:
                         yield event
             assert result is not None
             usage += result.usage
-            log.info(
-                "llm_call",
-                step=steps,
-                model=result.model,
-                prompt=cfg.prompt_ref,
-                prompt_sha=cfg.prompt_sha,
-                stop_reason=result.stop_reason,
-                served_by_fallback=result.served_by_fallback,
-                provider_request_id=result.request_id,
-                input_tokens=result.usage.input_tokens,
-                output_tokens=result.usage.output_tokens,
-                cache_read_input_tokens=result.usage.cache_read_input_tokens,
-                cache_creation_input_tokens=result.usage.cache_creation_input_tokens,
-            )
-
             if result.stop_reason != "tool_use" or not result.tool_calls:
                 reason = "refusal" if result.refused else (result.stop_reason or "end_turn")
                 yield AgentFinished(

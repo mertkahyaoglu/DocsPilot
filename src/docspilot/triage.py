@@ -33,7 +33,9 @@ class TriageError(Exception):
     pass
 
 
-async def triage(llm: LLM, *, message: str, system: str, model: str) -> tuple[Triage, Usage]:
+async def triage(
+    llm: LLM, *, message: str, system: str, model: str, purpose: str = "triage"
+) -> tuple[Triage, Usage]:
     result = await complete(
         llm,
         LLMRequest(
@@ -43,6 +45,7 @@ async def triage(llm: LLM, *, message: str, system: str, model: str) -> tuple[Tr
             max_tokens=1024,
             effort="low",
             json_schema=anthropic.transform_schema(Triage),
+            purpose=purpose,
         ),
     )
     if result.refused:
