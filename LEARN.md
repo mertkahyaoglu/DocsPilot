@@ -308,3 +308,108 @@ in the same PR, with the reason.
 `POST /v1/feedback` stores thumbs keyed by `request_id` (returned in the `done`
 event and the `X-Request-ID` header). Phase 5 makes the same id the trace id, so a 👎
 links straight to the retrieval, prompt version and tokens that produced it.
+
+---
+
+## Phase 5: Observability and cost
+
+An LLM app fails in ways HTTP dashboards cannot see: the request is a 200, fast, and
+wrong (or 40x more expensive than last week). You need three views: **traces** (what
+happened in *this* request), **metrics** (what is happening in aggregate), **cost**
+(what it is costing, per call and per feature).
+
+### Traces (`telemetry.py`, OpenTelemetry)
+One trace per chat turn:
+```
+chat.request
+├─ llm.answer            model, tokens, cache tokens, cost, ttft, stop_reason, fallback
+├─ tool.search_docs
+│   └─ retrieval.search  vector/keyword candidates, returned
+└─ llm.answer
+```
+- Standard **GenAI semantic-convention** attribute names (`gen_ai.usage.input_tokens`,
+  ...), so Jaeger/Tempo/Langfuse/Honeycomb all render LLM calls sensibly.
+- Export is OTLP/HTTP, configured purely by `OTEL_EXPORTER_OTLP_ENDPOINT` (+ headers).
+  For Langfuse point it at `<host>/api/public/otel` with a Basic-auth header.
+- `docker-compose.observability.yml` gives Jaeger + Prometheus locally (verified:
+  spans arrive with the attributes above).
+- **Content is not recorded by default.** `DOCSPILOT_TRACE_CONTENT=true` adds redacted,
+  truncated query/answer text. Prompts contain customer data: treat traces as a data
+  store with the same retention/access rules as your DB.
+- Logs carry `trace_id`/`span_id`, and `request_id` is the join key with feedback
+  (Phase 4): a 👎 -> its trace -> retrieval, prompt version, tokens.
+
+### One choke point: `InstrumentedLLM`
+A decorator around the model client, so agent steps, triage, routing and the judge are
+all measured the same way, and nothing can forget to instrument. Each call yields a
+span, metrics, and one `llm_call` log line with cost.
+
+### Metrics (`/metrics`, Prometheus)
+`docspilot_llm_{requests,tokens,cost_usd}_total` and latency / time-to-first-token
+histograms, labelled by **model and purpose** (answer/triage/judge/route). Plus tool
+outcomes, retrieval stage latency, *degraded retrieval* counters, cache and routing
+counters. `ops/alerts.yml` has starting alerts: error rate, p95 latency, hourly spend,
+degraded retrieval, cold prompt cache. Per-user labels are deliberately absent
+(unbounded cardinality): per-user cost belongs in logs/traces and the budgets of
+Phase 6.
+
+Time-to-first-token is the latency users feel in a streaming UI; total latency is
+what your timeouts care about. Track both.
+
+### Cost levers, in the order to pull them
+1. **Measure** per request and per purpose first (above). Most surprises are one
+   feature, one prompt, or one runaway loop.
+2. **Prompt caching** (`cache=True`): the provider caches the prefix `tools -> system ->
+   messages`; reads cost ~10% of input price. It is a *prefix match*: tools are sorted,
+   the system prompt has no timestamps or per-user text, volatile content goes last.
+   A test asserts the prefix is byte-identical across requests. Verify with
+   `cache_read_tokens` (the `PromptCacheCold` alert); prefixes under the model's
+   minimum cacheable size silently do not cache.
+3. **Response cache** (`cache.py`): exact-match, first-turn, read-only, complete answers
+   only; key = normalised question + prompt hash + model + effort + corpus version;
+   TTL + LRU. A hit costs zero model calls. Not done on purpose: semantic caching
+   (a near-miss that confidently returns the wrong policy is worse than paying), and
+   anything touching user-specific tools.
+4. **Effort and model choice**: `effort` is a per-request dial; use the small model for
+   classification/judging (`purpose` labels show where tokens go).
+5. **Routing** (`DOCSPILOT_ROUTING=true`, off by default): the small model classifies the
+   first message; small talk is answered by the small model with no tools, everything
+   else goes to the agent. This is a *trade*, not a free win: every other request pays
+   an extra round trip (cost + latency). It only helps when a large share of traffic is
+   easy; check `docspilot_route_total` and the eval cost column before enabling. It
+   fails open and never routes follow-up turns (a bare "yes" after a ticket offer is not
+   small talk).
+6. **Context budget**: retrieval volume (Phase 3) is usually the biggest input lever.
+
+### Hard-won details (all found in review)
+- **Never hold an OTel span as "current" across an `async` generator `yield`.** On client
+  disconnect the generator is finalised from another context: you get detach errors,
+  a stuck in-flight gauge and spans that never end. Spans that live across yields are
+  created with `start_span` and ended in `finally`; they are *activated* only around
+  each step of the inner stream so child spans still parent correctly.
+- **Disconnects are not errors.** `GeneratorExit`/`CancelledError` become
+  `outcome="cancelled"`, otherwise a mobile network blip pages you through the error-rate
+  alert.
+- **Do not cache what was produced under failure.** The response cache refuses turns whose
+  search errored, ran degraded (a retrieval leg or reranker was down), never searched,
+  used any non-docs tool, came from the fallback model, or were routed to the small
+  model. A cached "sorry, I couldn't search right now" would otherwise outlive the outage
+  for the whole TTL, for every user.
+- **The corpus version is refreshed**, not computed once: a re-ingest by another process
+  must invalidate cached answers within seconds, not at the next deploy.
+- **A metric you cannot trust is worse than none**: one `model` label (the model that
+  actually served), explicit counters for fallbacks and for *unpriced* models, so
+  `SpendRateHigh` cannot silently under-report.
+- OTLP headers are URL-decoded/trimmed per spec (a Basic-auth header with `%20` otherwise
+  401s and traces vanish without an error). `/metrics` is only served in prod when
+  `DOCSPILOT_METRICS_TOKEN` is set. Redaction covers common token shapes, IBAN, SSN and
+  URL credentials, and remains a net, not a guarantee.
+
+### What breaks in production
+| Symptom | Cause | Where to look |
+|---|---|---|
+| Bill doubled, quality same | cache prefix broke (timestamp in prompt), or a loop | `cache_read` ratio, steps per request |
+| p95 latency up | retrieval degraded, fallback model, long tool loops | `retrieval_degraded`, `served_by_fallback`, spans |
+| Cache hit ratio 0 | volatile bytes in prefix; below minimum size | prefix test, `cache_write` tokens |
+| Stale answers after re-index | response cache outlives corpus | corpus-version key, TTL |
+| PII in the tracing backend | content tracing on without redaction/retention | `trace_content`, `redact.py` |

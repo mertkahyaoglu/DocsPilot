@@ -17,6 +17,7 @@ make check                  # ruff + mypy + pytest (unit)
 make test-integration       # pgvector tests against `make db`
 make eval-retrieval         # offline retrieval metrics + regression gate
 make eval-answers           # end-to-end agent + LLM judge (needs keys, spends credits)
+docker compose -f docker-compose.yml -f docker-compose.observability.yml up -d   # Jaeger + Prometheus
 ```
 
 ## Status
@@ -27,7 +28,7 @@ make eval-answers           # end-to-end agent + LLM judge (needs keys, spends c
 | 2 | Tool use, human confirmation, structured output | ✅ |
 | 3 | RAG: chunking, pgvector hybrid search, rerank, citations | ✅ |
 | 4 | Evals: retrieval metrics, judge + calibration, CI gate, feedback | ✅ |
-| 5 | Observability, cost | ⏳ |
+| 5 | Observability & cost: OTel traces, Prometheus, caching, routing | ✅ |
 | 6 | Safety, guardrails | ⏳ |
 | 7 | Ship | ⏳ |
 | 8 | Multi-agent, MCP, scaling, fine-tuning, OIDC | ⏳ |

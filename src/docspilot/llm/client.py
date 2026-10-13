@@ -82,6 +82,8 @@ class AnthropicLLM:
             output_config["format"] = {"type": "json_schema", "schema": request.json_schema}
         if output_config:
             kwargs["output_config"] = output_config
+        if request.cache:
+            kwargs["cache_control"] = {"type": "ephemeral"}
         # Deliberately absent: temperature/top_p (rejected by current models) and
         # `thinking` (adaptive by default; effort is the control knob).
         return kwargs

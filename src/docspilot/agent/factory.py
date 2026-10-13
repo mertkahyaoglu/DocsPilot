@@ -9,6 +9,7 @@ from docspilot.config import Settings
 from docspilot.llm.types import LLM
 from docspilot.prompts import Prompt
 from docspilot.rag.retrieve import Retriever
+from docspilot.telemetry import Telemetry
 
 
 def build_agent(
@@ -18,10 +19,11 @@ def build_agent(
     retriever: Retriever,
     pending: PendingStore,
     answer_prompt: Prompt,
+    telemetry: Telemetry | None = None,
 ) -> Agent:
     return Agent(
         llm,
-        ToolRegistry(default_tools(retriever)),
+        ToolRegistry(default_tools(retriever), telemetry=telemetry),
         pending,
         AgentConfig(
             model=settings.model_answer,
@@ -30,6 +32,7 @@ def build_agent(
             effort=settings.effort_answer,
             max_steps=settings.max_agent_steps,
             tool_timeout_s=settings.tool_timeout_s,
+            prompt_caching=settings.prompt_caching,
             prompt_ref=answer_prompt.ref,
             prompt_sha=answer_prompt.sha,
         ),

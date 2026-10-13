@@ -5,8 +5,9 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 from abc import ABC, abstractmethod
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from typing import Any, ClassVar
 
 import anthropic
@@ -14,6 +15,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from docspilot.logging import get_logger
 from docspilot.rag.retrieve import Retriever
+from docspilot.telemetry import Telemetry
 from docspilot.tickets import Severity, TicketStore
 
 log = get_logger("tools")
@@ -26,6 +28,9 @@ class ToolContext:
     user_id: str
     tickets: TicketStore
     idempotency_key: str | None = None
+    #: Per-request scratch set tools use to tell the caller about the turn
+    #: ("degraded_retrieval"). Shared by reference across `with_key` copies.
+    flags: set[str] = field(default_factory=set)
 
     def with_key(self, key: str) -> ToolContext:
         return replace(self, idempotency_key=key)
@@ -91,7 +96,8 @@ class Tool(ABC):
 
 
 class ToolRegistry:
-    def __init__(self, tools: list[Tool]) -> None:
+    def __init__(self, tools: list[Tool], telemetry: Telemetry | None = None) -> None:
+        self._tel = telemetry or Telemetry.noop()
         names = [t.name for t in tools]
         if len(set(names)) != len(names):
             raise ValueError("duplicate tool names")
@@ -118,6 +124,19 @@ class ToolRegistry:
             return ToolOutcome(f"Invalid arguments for {name}: {problems}", True)
 
     async def execute(
+        self, tool: Tool, args: ToolInput, ctx: ToolContext, *, timeout_s: float
+    ) -> ToolOutcome:
+        started = time.perf_counter()
+        with self._tel.span(f"tool.{tool.name}", **{"docspilot.tool": tool.name}) as span:
+            outcome = await self._execute(tool, args, ctx, timeout_s=timeout_s)
+            span.set_attribute("docspilot.tool.is_error", outcome.is_error)
+            span.set_attribute("docspilot.tool.sources", len(outcome.sources))
+        m = self._tel.metrics
+        m.tool_calls.labels(tool.name, "error" if outcome.is_error else "ok").inc()
+        m.tool_latency.labels(tool.name).observe(time.perf_counter() - started)
+        return outcome
+
+    async def _execute(
         self, tool: Tool, args: ToolInput, ctx: ToolContext, *, timeout_s: float
     ) -> ToolOutcome:
         try:
@@ -244,6 +263,8 @@ class SearchDocsTool(Tool):
 
     async def run(self, args: SearchDocsInput, ctx: ToolContext) -> dict[str, Any]:
         result = await self._retriever.search(args.query)
+        if result.degraded:
+            ctx.flags.add("degraded_retrieval")
         results: list[dict[str, Any]] = []
         for hit in result.hits:  # best first: when the budget runs out the tail is dropped
             c = hit.chunk
