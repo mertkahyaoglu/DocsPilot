@@ -102,7 +102,7 @@ async def test_valid_token_yields_the_subject_and_discovery_is_used() -> None:
     idp = IdP()
     auth = make_auth(idp)
     principal = await auth.authenticate(idp.token())
-    assert principal is not None and principal.user_id == "user_123"
+    assert principal is not None and principal.user_id == "oidc:user_123"
     assert idp.discovery_hits == 1 and idp.jwks_hits == 1
     await auth.authenticate(idp.token())  # cached: no further IdP traffic
     assert idp.jwks_hits == 1
@@ -199,7 +199,7 @@ async def test_chain_routes_jwts_to_oidc_and_other_tokens_to_api_keys() -> None:
     chain = ChainAuthenticator(
         make_auth(idp), ApiKeyAuthenticator({"svc": "service-key-0123456789"})
     )
-    assert (await chain.authenticate(idp.token())).user_id == "user_123"  # type: ignore[union-attr]
+    assert (await chain.authenticate(idp.token())).user_id == "oidc:user_123"  # type: ignore[union-attr]
     assert (await chain.authenticate("service-key-0123456789")).user_id == "svc"  # type: ignore[union-attr]
     assert await chain.authenticate("garbage") is None
     assert await chain.authenticate(None) is None
@@ -248,7 +248,7 @@ async def test_api_accepts_oidc_tokens_and_scopes_data_to_the_subject(
     )
     assert ok.status_code == 200
     (ticket,) = app.state.tickets._by_id.values()
-    assert ticket.user_id == "user_abc"
+    assert ticket.user_id == "oidc:user_abc"
     await close(gen)
 
 
@@ -313,7 +313,11 @@ async def test_specialists_have_disjoint_privileges() -> None:
     orch = await build_multi(FakeLLM(), StubClassifier())
     docs, tickets = orch._agents["docs"], orch._agents["tickets"]
     assert spec_names(docs) == {"search_docs"}  # reads untrusted text, cannot write
-    assert spec_names(tickets) == {"create_ticket", "get_ticket"}  # acts, never sees documents
+    assert spec_names(tickets) == {
+        "create_ticket",
+        "get_ticket",
+        "hand_off_to_docs",
+    }  # no retrieval
     assert tickets._config.model == "claude-sonnet-5-5" and docs._config.model == "claude-opus-5-5"
 
 
@@ -442,3 +446,184 @@ async def test_multi_architecture_end_to_end_and_resume_goes_to_the_right_specia
     assert parse_sse(ok.text)[-1][1]["model"] == "claude-sonnet-5-5"
     assert len(app.state.tickets._by_id) == 1
     await close(gen)
+
+
+# ---- review round -----------------------------------------------------------------------
+
+
+async def test_non_rsa_keys_and_forged_headers_cannot_cause_a_500() -> None:
+    from cryptography.hazmat.primitives.asymmetric import ec
+
+    idp = IdP()
+    ec_key = ec.generate_private_key(ec.SECP256R1())
+    jwk = json.loads(jwt.algorithms.ECAlgorithm.to_jwk(ec_key.public_key()))
+    jwk.update(kid="ec1", use="sig", alg="ES256")
+    base = idp.jwks
+
+    def jwks_with_ec() -> dict[str, Any]:
+        data = base()
+        data["keys"].append(jwk)
+        return data
+
+    idp.jwks = jwks_with_ec  # type: ignore[method-assign]
+    auth = make_auth(idp)
+    assert await auth.authenticate(idp.token()) is not None
+    # attacker claims RS256 but points at the EC key's kid
+    forged = jwt.encode(
+        {"iss": ISSUER, "aud": AUD, "sub": "x", "exp": int(time.time()) + 60},
+        idp.keys["k1"],
+        algorithm="RS256",
+        headers={"kid": "ec1"},
+    )
+    assert await auth.authenticate(forged) is None  # filtered by key type: not a 500
+
+
+async def test_subject_validation_and_namespacing() -> None:
+    idp = IdP()
+    auth = make_auth(idp)
+    for bad in ("anonymous ", " alice", "a\nb", "x" * 201, "*"):
+        assert await auth.authenticate(idp.token(sub=bad)) is None, repr(bad)
+    ok = await auth.authenticate(idp.token(sub="alice"))
+    assert ok is not None and ok.user_id == "oidc:alice"  # cannot collide with API-key "alice"
+
+
+async def test_idp_outage_is_unavailable_not_unauthenticated_and_does_not_pile_up() -> None:
+    import asyncio
+
+    from docspilot.auth import AuthUnavailableError
+
+    idp = IdP()
+    idp.down = True
+    hits = {"n": 0}
+
+    async def slow_handler(request: httpx.Request) -> httpx.Response:
+        hits["n"] += 1
+        await asyncio.sleep(0.15)
+        return httpx.Response(503)
+
+    auth = OIDCAuthenticator(
+        issuer=ISSUER,
+        audience=AUD,
+        jwks_url="https://idp.example.com/jwks.json",
+        client=httpx.AsyncClient(transport=httpx.MockTransport(slow_handler)),
+    )
+    token = IdP().token()  # signature irrelevant: we never get keys
+    results = await asyncio.gather(
+        *(auth.authenticate(token) for _ in range(6)), return_exceptions=True
+    )
+    assert all(isinstance(r, AuthUnavailableError) for r in results)
+    assert hits["n"] <= 2  # waiters reuse the failed attempt instead of repeating it
+
+
+async def test_api_returns_503_when_keys_are_unavailable(settings: Settings) -> None:
+    app, client, gen = await open_client(settings, FakeLLM())
+    dead = OIDCAuthenticator(
+        issuer=ISSUER,
+        audience=AUD,
+        jwks_url="https://idp.example.com/jwks.json",
+        client=httpx.AsyncClient(transport=httpx.MockTransport(lambda r: httpx.Response(503))),
+    )
+    app.state.authenticator = ChainAuthenticator(dead, None)
+    token = IdP().token()
+    res = await client.post(
+        "/v1/chat",
+        json={"messages": [{"role": "user", "content": "hi"}]},
+        headers={"authorization": f"Bearer {token}"},
+    )
+    assert res.status_code == 503 and res.headers["retry-after"] == "5"
+    await close(gen)
+
+
+async def test_strict_environment_refuses_to_start_without_working_auth(
+    settings: Settings,
+) -> None:
+    from pydantic import SecretStr
+
+    from docspilot.api.app import create_app
+
+    cfg = settings.model_copy(update={"env": "staging", "api_keys": SecretStr(",")})
+    app = create_app(cfg, FakeLLM())
+    with pytest.raises(RuntimeError, match="authentication is required"):
+        async with app.router.lifespan_context(app):
+            pass
+
+
+# ---- orchestrator: sticky routing, handoff, no double classification ---------------------
+
+
+def test_followup_rules_are_conservative() -> None:
+    def hist(*pairs: tuple[str, str]) -> list[dict[str, str]]:
+        return [{"role": r, "content": c} for r, c in pairs]
+
+    clarify = hist(
+        ("user", "please open a ticket"),
+        ("assistant", "Sure. Which invoice is affected and what was the error?"),
+    )
+    # the details answering a ticketing clarification stay with the ticketing specialist
+    assert is_ticket_followup(clarify + hist(("user", "INV-0192, charged twice on Oct 3")))
+    # ... but a new question is classified normally
+    assert not is_ticket_followup(
+        hist(
+            ("assistant", "Shall I open a ticket for this?"),
+            ("user", "what is the refund window?"),
+        )
+    )
+    # a bare "ok" after an answer that merely mentions tickets is not a ticket flow
+    assert not is_ticket_followup(
+        hist(("assistant", "See the ticket policy page for details."), ("user", "ok"))
+    )
+    assert is_ticket_followup(hist(("assistant", "Want me to open a ticket?"), ("user", "ok")))
+
+
+async def test_misrouted_product_question_is_handed_back_to_docs() -> None:
+    def script(req: LLMRequest) -> Script:
+        if "ticketing specialist" in str(req.system):
+            return Script(text="", tool_calls=[ToolCall("h", "hand_off_to_docs", {})])
+        last = req.messages[-1]
+        if last["role"] == "user" and isinstance(last["content"], list):
+            return Script(text="30 days [policies/refunds.md]")
+        return Script(tool_calls=[ToolCall("s", "search_docs", {"query": "refund window days"})])
+
+    llm = FakeLLM(script)
+    orch = await build_multi(llm, StubClassifier("ticket_request"))  # classifier got it wrong
+    events = [
+        e
+        async for e in orch.run(
+            [{"role": "user", "content": "how long is the refund window"}],
+            ToolContext("u", InMemoryTicketStore()),
+        )
+    ]
+    final = events[-1]
+    assert type(final).__name__ == "AgentFinished" and final.text.startswith("30 days")
+    assert "hand_off_to_docs" in spec_names(orch._agents["tickets"])
+    assert "hand_off_to_docs" not in spec_names(orch._agents["docs"])  # no ping-pong
+
+
+async def test_multi_architecture_classifies_once_even_with_routing_enabled(
+    settings: Settings,
+) -> None:
+    calls = {"n": 0}
+
+    def script(req: LLMRequest) -> Script:
+        if req.purpose in ("route", "triage"):
+            calls["n"] += 1
+            return Script(
+                text=json.dumps(
+                    {
+                        "intent": "question",
+                        "urgency": "low",
+                        "product_area": "other",
+                        "summary": "s",
+                    }
+                )
+            )
+        return base_script(req)
+
+    _, client, gen = await open_client(
+        settings, FakeLLM(script), architecture="multi", routing=True, response_cache_ttl_s=0
+    )
+    await client.post(
+        "/v1/chat", json={"messages": [{"role": "user", "content": "refund window?"}]}
+    )
+    await close(gen)
+    assert calls["n"] == 1

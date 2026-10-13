@@ -28,6 +28,11 @@ class Principal:
     user_id: str
 
 
+class AuthUnavailableError(Exception):
+    """The credential could not be *checked* (e.g. the IdP's keys are unreachable and
+    none are cached). This is a 503, not a 401: clients must not log users out for it."""
+
+
 class Authenticator(Protocol):
     @property
     def required(self) -> bool: ...
@@ -85,6 +90,11 @@ def parse_api_keys(spec: str) -> dict[str, str]:
 # ---- OIDC ----------------------------------------------------------------------------
 
 
+# JOSE algorithm family -> JWK key type: a key of another type can never verify the token
+# and must not reach the signature code (it would raise instead of rejecting).
+_KTY = {"RS": "RSA", "PS": "RSA", "ES": "EC"}
+
+
 class OIDCAuthenticator:
     """Verifies RS/ES-signed JWT access tokens against the issuer's JWKS.
 
@@ -126,7 +136,11 @@ class OIDCAuthenticator:
         self._clock = clock
         self._keys: dict[str, PyJWK] = {}
         self._fetched_at: float | None = None
+        self._last_refresh_ok = False
         self._lock = asyncio.Lock()
+        self._kty = {_KTY[a[:2]] for a in algorithms if a[:2] in _KTY} | (
+            {"OKP"} if "EdDSA" in algorithms else set()
+        )
 
     @property
     def required(self) -> bool:
@@ -163,10 +177,21 @@ class OIDCAuthenticator:
         except jwt.PyJWTError as exc:
             log.info("oidc_token_rejected", reason=type(exc).__name__)
             return None
-        user = claims.get(self._user_claim)
-        if not isinstance(user, str) or not user.strip() or user in RESERVED_IDS:
+        except Exception:
+            log.warning("oidc_token_unverifiable", exc_info=True)
             return None
-        return Principal(user)
+        user = claims.get(self._user_claim)
+        if (
+            not isinstance(user, str)
+            or user != user.strip()
+            or not user
+            or len(user) > 200
+            or any(ord(c) < 32 for c in user)
+            or user in RESERVED_IDS
+        ):
+            return None
+        # Namespaced: an IdP subject can never collide with an API-key user id.
+        return Principal(f"oidc:{user}")
 
     # -- JWKS ------------------------------------------------------------------------
 
@@ -180,6 +205,8 @@ class OIDCAuthenticator:
             )
             if can_refresh:
                 await self._refresh()  # key rotation: the IdP published a new kid
+        if not self._keys and not self._last_refresh_ok:
+            raise AuthUnavailableError("identity provider keys are unavailable")
         return self._keys.get(kid)
 
     async def _jwks_url_resolved(self) -> str:
@@ -196,24 +223,32 @@ class OIDCAuthenticator:
 
     async def _refresh(self) -> None:
         async with self._lock:
-            now = self._clock()
-            if self._fetched_at is not None and now - self._fetched_at < 1.0:
-                return  # another request just refreshed
+            # Waiters queued behind a refresh that just finished (or just failed) reuse it
+            # instead of each repeating the fetch.
+            if self._fetched_at is not None and self._clock() - self._fetched_at < 1.0:
+                return
             try:
                 res = await self._client.get(await self._jwks_url_resolved())
                 res.raise_for_status()
                 keys: dict[str, PyJWK] = {}
                 for jwk in res.json().get("keys", []):
-                    if jwk.get("use", "sig") == "sig" and jwk.get("kid"):
-                        try:
-                            keys[jwk["kid"]] = PyJWK(jwk)
-                        except jwt.PyJWTError:
-                            continue
+                    if jwk.get("use", "sig") != "sig" or not jwk.get("kid"):
+                        continue
+                    if self._kty and jwk.get("kty") not in self._kty:
+                        continue
+                    try:
+                        keys[jwk["kid"]] = PyJWK(jwk)
+                    except jwt.PyJWTError:
+                        continue
                 self._keys = keys
+                self._last_refresh_ok = True
             except Exception:
+                self._last_refresh_ok = False
                 log.warning("jwks_refresh_failed", keys_cached=len(self._keys))
             finally:
-                self._fetched_at = now  # also rate-limits retries when the IdP is down
+                # stamped *after* the attempt: a slow failing fetch must still start the
+                # cool-down, or every queued request repeats it
+                self._fetched_at = self._clock()
 
 
 class ChainAuthenticator:

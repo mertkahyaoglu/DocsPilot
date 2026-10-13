@@ -176,7 +176,11 @@ async def cmd_answers(args: argparse.Namespace) -> int:
                 "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
                 "answer_model": settings.model_answer,
                 "judge_model": settings.model_judge,
-                "answer_prompt": answer_prompt.ref,
+                "answer_prompt": (
+                    "agent_docs+agent_tickets"
+                    if settings.architecture == "multi"
+                    else answer_prompt.ref
+                ),
                 "architecture": settings.architecture,
                 "answer_prompt_sha": answer_prompt.sha,
                 "embedder": rag.embedder.name,

@@ -5,7 +5,7 @@ from __future__ import annotations
 from docspilot.agent.loop import Agent, AgentConfig
 from docspilot.agent.orchestrator import Orchestrator
 from docspilot.agent.pending import PendingStore
-from docspilot.agent.tools import Tool, ToolRegistry, default_tools
+from docspilot.agent.tools import HandoffToDocsTool, Tool, ToolRegistry, default_tools
 from docspilot.config import Settings
 from docspilot.intents import IntentClassifier
 from docspilot.llm.types import LLM
@@ -66,9 +66,12 @@ def build_orchestrator(
     can act (human-gated), never sees documents."""
     all_tools = {
         t.name: t
-        for t in default_tools(
-            retriever, injection_policy=settings.injection_policy, telemetry=telemetry
-        )
+        for t in [
+            *default_tools(
+                retriever, injection_policy=settings.injection_policy, telemetry=telemetry
+            ),
+            HandoffToDocsTool(),
+        ]
     }
 
     def make(name: str, prompt: Prompt, tool_names: list[str], model: str) -> Agent:
@@ -96,7 +99,10 @@ def build_orchestrator(
         specialists={
             "docs": make("docs", docs_prompt, ["search_docs"], settings.model_answer),
             "tickets": make(
-                "tickets", tickets_prompt, ["create_ticket", "get_ticket"], settings.model_tickets
+                "tickets",
+                tickets_prompt,
+                ["create_ticket", "get_ticket", "hand_off_to_docs"],
+                settings.model_tickets,
             ),
         },
     )

@@ -30,6 +30,8 @@ class Settings(BaseSettings):
     env: Literal["dev", "test", "staging", "prod"] = "dev"
     log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR"] = "INFO"
     log_json: bool = False
+    #: stdio MCP servers speak JSON-RPC on stdout: their logs must go to stderr.
+    log_stream: Literal["stdout", "stderr"] = "stdout"
 
     # The SDK also reads ANTHROPIC_API_KEY itself; we surface it for fail-fast validation.
     anthropic_api_key: SecretStr | None = Field(default=None, validation_alias="ANTHROPIC_API_KEY")
@@ -119,6 +121,9 @@ class Settings(BaseSettings):
     #: External MCP servers whose tools the (single) agent may use: "name=https://host/mcp,
     #: name2=stdio:python -m some_server". Their output is treated as untrusted data.
     mcp_servers: str = ""
+    #: Honour remote `readOnlyHint` (skips the human gate). Off: the remote is not trusted
+    #: to describe its own side effects.
+    mcp_trust_read_only: bool = False
 
     max_agent_steps: int = Field(default=6, ge=1, le=20)
     tool_timeout_s: float = Field(default=15.0, gt=0)
@@ -195,8 +200,10 @@ class Settings(BaseSettings):
                 raise ValueError("daily budgets are required outside dev/test")
         if bool(self.oidc_issuer) != bool(self.oidc_audience):
             raise ValueError("DOCSPILOT_OIDC_ISSUER and DOCSPILOT_OIDC_AUDIENCE go together")
-        if self.oidc_issuer and not self.oidc_issuer.startswith("https://") and self.strict:
-            raise ValueError("DOCSPILOT_OIDC_ISSUER must be https:// outside dev/test")
+        if self.strict:
+            for url in (self.oidc_issuer, self.oidc_jwks_url):
+                if url and not url.startswith("https://"):
+                    raise ValueError("OIDC issuer and JWKS URLs must be https:// outside dev/test")
         if "voyage" in (self.embedder, self.rerank) and self.voyage_api_key is None:
             raise ValueError("VOYAGE_API_KEY is required for embedder/rerank=voyage")
         if self.rerank_min_score is not None and self.resolved_rerank == "none":

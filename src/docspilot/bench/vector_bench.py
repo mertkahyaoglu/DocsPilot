@@ -67,6 +67,15 @@ def percentile(values: list[float], q: float) -> float:
 def run(args: argparse.Namespace) -> dict[str, Any]:
     dsn = args.dsn or os.environ["DATABASE_URL"]
     schema = f"bench_{secrets.token_hex(4)}"
+    try:
+        return _run(args, dsn, schema)
+    finally:
+        # never leave a multi-hundred-MB schema behind, even if a build fails midway
+        with psycopg.connect(dsn, autocommit=True) as conn:
+            conn.execute(SQL("DROP SCHEMA IF EXISTS {} CASCADE").format(Identifier(schema)))
+
+
+def _run(args: argparse.Namespace, dsn: str, schema: str) -> dict[str, Any]:
     rng = np.random.default_rng(args.seed)
     data = clustered(args.n, args.dim, args.clusters, rng, args.noise)
     # Queries are perturbed copies of stored vectors: like a real search, each query has a
@@ -156,6 +165,12 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         def index_size(name: str) -> float:
             return float(scalar(conn.execute("SELECT pg_relation_size(%s::regclass)/1e6", (name,))))
 
+        def uses_index(sql: str, index: str) -> bool:
+            """EXPLAIN the query for real: a benchmark of an index the planner ignores is a
+            benchmark of a sequential scan."""
+            plan = conn.execute("EXPLAIN " + sql, (queries[0],)).fetchall()
+            return any(index in str(r) for r in plan)
+
         ident = lambda q: q
         # --- IVFFlat -------------------------------------------------------------
         lists = max(10, int(math.sqrt(args.n)))
@@ -165,6 +180,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         )
         build = time.perf_counter() - t
         size = index_size("ivf")
+        ivf_used = uses_index(search_sql("embedding"), "ivf")
         for probes in (1, 10, 30):
             rows.append(
                 bench(
@@ -173,7 +189,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                     ident,
                     build,
                     size,
-                    "needs training data; rebuild as data drifts",
+                    "needs training data; rebuild as data drifts"
+                    + ("" if ivf_used else " (INDEX NOT USED)"),
                     [f"SET ivfflat.probes = {probes}"],
                 )
             )
@@ -186,6 +203,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         )
         build = time.perf_counter() - t
         size = index_size("hn")
+        used_index = uses_index(search_sql("embedding"), "hn")
         for ef in (10, 40, 100, 200):
             rows.append(
                 bench(
@@ -194,12 +212,10 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                     ident,
                     build,
                     size,
-                    "incremental inserts; larger RAM",
+                    "incremental inserts; larger RAM" + ("" if used_index else " (INDEX NOT USED)"),
                     [f"SET hnsw.ef_search = {ef}"],
                 )
             )
-        plan = conn.execute("EXPLAIN " + search_sql("embedding"), (queries[0],)).fetchall()
-        used_index = any("hn" in str(r) for r in plan)
         conn.execute("DROP INDEX hn")
 
         # --- HNSW on half precision (scalar quantisation) -------------------------
@@ -211,6 +227,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         build = time.perf_counter() - t
         size = index_size("hn_half")
         half_sql = f"SELECT id FROM v ORDER BY embedding::halfvec({args.dim}) <=> %s::halfvec({args.dim}) LIMIT {k}"
+        half_used = uses_index(half_sql, "hn_half")
         for ef in (40, 100):
             rows.append(
                 bench(
@@ -219,13 +236,12 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                     ident,
                     build,
                     size,
-                    "half the index size; tiny recall cost",
+                    "half-precision storage; recall cost is small"
+                    + ("" if half_used else " (INDEX NOT USED)"),
                     [f"SET hnsw.ef_search = {ef}"],
                 )
             )
         conn.execute("DROP INDEX hn_half")
-
-        conn.execute(SQL("DROP SCHEMA {} CASCADE").format(Identifier(schema)))
 
     return {
         "n": args.n,
@@ -235,7 +251,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "k": k,
         "load_s": round(load_s, 1),
         "table_mb": round(float(table_mb), 1),
-        "hnsw_used_index": used_index,
+        "indexes_used": {"ivfflat": ivf_used, "hnsw": used_index, "hnsw_halfvec": half_used},
         "rows": [asdict(r) for r in rows],
     }
 
@@ -249,8 +265,9 @@ def render(result: dict[str, Any]) -> str:
         "|---|---:|---:|---:|---:|---:|",
     ]
     for r in result["rows"]:
+        flag = " ⚠ index not used" if "INDEX NOT USED" in r.get("note", "") else ""
         lines.append(
-            f"| {r['name']} | {r['build_s']:.1f} | {r['index_mb']:.0f} | {r['recall']:.3f} "
+            f"| {r['name']}{flag} | {r['build_s']:.1f} | {r['index_mb']:.0f} | {r['recall']:.3f} "
             f"| {r['p50_ms']:.1f} | {r['p95_ms']:.1f} |"
         )
     return "\n".join(lines)

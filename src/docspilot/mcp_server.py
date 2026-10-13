@@ -30,6 +30,7 @@ from starlette.types import ASGIApp, Receive, Scope, Send
 
 from docspilot.agent.tools import SearchDocsTool, ToolContext, ToolError, default_tools
 from docspilot.auth import Authenticator
+from docspilot.ratelimit import RateLimiter
 from docspilot.safety.injection import Policy
 from docspilot.tickets import Severity, TicketStore
 
@@ -44,7 +45,7 @@ def build_mcp_server(
     retriever: Any,
     tickets: TicketStore,
     injection_policy: Policy = "redact",
-    default_user: str = "mcp-local",
+    default_user: str | None = "mcp-local",
 ) -> MCPServer:
     server = MCPServer(
         "DocsPilot",
@@ -57,7 +58,10 @@ def build_mcp_server(
     search = SearchDocsTool(retriever, policy=injection_policy)
 
     def user() -> str:
-        return current_user.get() or default_user
+        found = current_user.get() or default_user
+        if found is None:  # HTTP: authentication must have set the caller; never fail open
+            raise RuntimeError("no authenticated user for this MCP request")
+        return found
 
     @server.tool(
         annotations=ToolAnnotations(
@@ -133,13 +137,20 @@ def build_mcp_server(
 class BearerAuthMiddleware:
     """Authenticate every HTTP request to the MCP endpoint and expose the user."""
 
-    def __init__(self, app: ASGIApp, authenticator: Authenticator) -> None:
+    def __init__(
+        self, app: ASGIApp, authenticator: Authenticator, limiter: RateLimiter | None = None
+    ) -> None:
         self.app = app
         self._auth = authenticator
+        self._limiter = limiter
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
-        if scope["type"] != "http":
+        if scope["type"] == "lifespan":
             await self.app(scope, receive, send)
+            return
+        if scope["type"] != "http":  # websockets etc.: not part of the protocol, never open
+            if scope["type"] == "websocket":
+                await send({"type": "websocket.close", "code": 1008})
             return
         headers = dict(scope["headers"])
         raw = headers.get(b"authorization", b"").decode("latin-1")
@@ -162,6 +173,23 @@ class BearerAuthMiddleware:
             )
             await send({"type": "http.response.body", "body": body})
             return
+        if self._limiter is not None:
+            wait = self._limiter.acquire(principal.user_id)
+            if wait > 0:
+                body = b'{"error":"rate_limited"}'
+                await send(
+                    {
+                        "type": "http.response.start",
+                        "status": 429,
+                        "headers": [
+                            (b"content-type", b"application/json"),
+                            (b"retry-after", str(max(1, int(wait) + 1)).encode()),
+                            (b"content-length", str(len(body)).encode()),
+                        ],
+                    }
+                )
+                await send({"type": "http.response.body", "body": body})
+                return
         reset = current_user.set(principal.user_id)
         try:
             await self.app(scope, receive, send)
@@ -171,24 +199,31 @@ class BearerAuthMiddleware:
 
 async def _amain(args: argparse.Namespace) -> None:
     from docspilot.api.app import create_app  # reuse the wiring (stores, embedder, ...)
+    from docspilot.config import get_settings
 
-    app = create_app()
+    settings = get_settings()
+    if args.transport == "stdio":
+        # stdout carries the JSON-RPC stream: nothing else may be written to it
+        settings = settings.model_copy(update={"log_stream": "stderr"})
+    app = create_app(settings)
     async with app.router.lifespan_context(app):
         rag = app.state.rag
-        settings = app.state.settings
+        stdio = args.transport == "stdio"
         server = build_mcp_server(
             retriever=rag.retriever,
             tickets=rag.tickets,
             injection_policy=settings.injection_policy,
+            default_user="mcp-local" if stdio else None,
         )
-        if args.transport == "stdio":
+        if stdio:
             await server.run_stdio_async()
             return
         if not app.state.authenticator.required:
             raise SystemExit("refusing to serve MCP over HTTP without authentication configured")
         import uvicorn
 
-        asgi = BearerAuthMiddleware(server.streamable_http_app(), app.state.authenticator)
+        limiter = RateLimiter(per_minute=settings.rate_limit_per_min or 60, burst=10)
+        asgi = BearerAuthMiddleware(server.streamable_http_app(), app.state.authenticator, limiter)
         config = uvicorn.Config(asgi, host=args.host, port=args.port, log_level="info")
         await uvicorn.Server(config).serve()
 

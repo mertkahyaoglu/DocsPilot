@@ -431,7 +431,7 @@ async def chat(
 
         history = [m.model_dump() for m in body.messages]
         events: AsyncGenerator[AgentEvent, None]
-        if settings.routing and first_turn:
+        if settings.routing and first_turn and settings.architecture == "single":
             events = _routed(request, settings, question, history, user_id, tickets, tel, slot)
         else:
             events = agent.run(history, ToolContext(user_id=user_id, tickets=tickets))

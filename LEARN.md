@@ -654,11 +654,15 @@ A router in front of two specialists:
 
 The reason to split is the **dual-LLM / privilege separation** pattern: the agent that reads
 poisoned text has nothing dangerous to call (a test shows an "injected" docs agent hitting
-`Unknown tool`), and the agent that can act never has untrusted text in its context. Smaller
+`Unknown tool`), and the agent that can act has no retrieval tool, so no retrieved document
+text is placed in its context by a tool. Residual, stated plainly: the conversation history
+it receives is client-supplied and can contain earlier docs-agent answers (model output
+derived from documents); that is bounded by the human confirmation of every write, not by
+isolation. Smaller
 focused prompts and a cheaper model for the simple task are side benefits. Costs: a routing
-hop (latency + a classification error rate), handoff bugs (the "yes" after a ticket offer
-must reach the right specialist: a heuristic + the pending action remembers which agent
-paused), and two prompts to keep consistent. Classifier failure routes to the *least
+hop (latency + a classification error rate), handoff bugs (a "yes" or a detail reply after the ticketing agent asked something must stay
+with it; a misrouted product question must be handed back: `hand_off_to_docs`; the pending
+action remembers which agent paused), and two prompts to keep consistent. Classifier failure routes to the *least
 privileged* specialist. Whether it beats the single agent on quality is empirical:
 
     uv run python -m docspilot.evals answers --architecture single
@@ -688,22 +692,25 @@ multi-step workflows with persistence and branching, not for a two-way router.
   remote JSON schema locally, and plaintext remote transports are refused.
 
 ### 4. Vector search at scale (`bench/`, `docs/SCALING.md`)
-Measured on 50k x 1024 vectors: exact scan ~165 ms; IVFFlat 6-9 s build, recall depends on
-data structure (0.57-0.76 on diffuse data); HNSW 31-53 s build, recall 0.94 @ ef=40 and
-0.97-0.98 @ 100-200 at 2.5-4 ms; `halfvec` makes the index 3x smaller for ~0.01-0.03 recall.
+Measured on 50k x 1024 vectors: exact scan ~165 ms; IVFFlat 5-9 s build, recall depends on
+data structure (0.69-0.82 on diffuse data, and it varied ~0.1 between runs); HNSW 31-53 s
+build, recall 0.94 @ ef=40 and 0.98 @ 100-200 at 2.4-8.5 ms; `halfvec` makes the index 3x
+smaller for ~0.01 recall.
 Conclusions that generalise: tune `ef_search` against your *eval set*; RAM, not CPU, is the
 limit; use half precision before reaching for a new database; Postgres stays the right home
 until you are well past 10^7 vectors or vector load hurts OLTP. This repo's 109 chunks need
 no index at all.
 
 ### 5. Fine-tuning (`finetune/`, `docs/FINETUNING.md`)
-We trained the intent router two ways on synthetic data and compared against the prompted
-small model's interface: TF-IDF + logistic regression (0.13 MB, 0.01 ms, trains in 7 s) and
-DistilBERT + LoRA (0.74M trainable params, 269 MB merged, 12-15 ms, 41 s). LoRA won on
-held-out templates (+9.5 pts) and **lost on independently-written questions (-6.6 pts)**:
-it learned the generator. Lessons: build the cheap baseline first; never judge on data you
-generated; fine-tune only when you have real labels, the call is high-volume, and a
-held-out production sample shows parity. For *answer quality* here, retrieval, prompts and
+We trained the intent router two ways on synthetic data: TF-IDF + logistic regression
+(0.13 MB, 0.01 ms, 2 s) and DistilBERT + LoRA (0.74M trainable params, 269 MB merged,
+12-15 ms, ~20 s). LoRA won big on held-out templates (0.88 vs 0.72) but on the
+independently-ish written golden questions the models are **statistically indistinguishable**
+(TF-IDF 0.817 vs LoRA 0.767 +/- 0.049 across seeds; single seeds ranged 0.72-0.83). A first
+run, before removing 6 train/test duplicates, gave a different winner. Lessons: build the
+cheap baseline first; never judge on data you generated; report seeds and intervals; a
+single n=60 number is a coin flip. Fine-tune only with real labels, high call volume and a
+held-out production sample showing parity. For *answer quality* here, retrieval, prompts and
 evals are the right tools, not weights.
 
 ### What to carry away
@@ -714,3 +721,17 @@ evals are the right tools, not weights.
 - Honest limits: nothing here was evaluated against live model quality (no API key in the
   build environment). `make eval-answers`, `make eval-calibrate`, and the `--llm` fine-tune
   comparison are ready and are the first things to run with keys.
+
+### Review lessons specific to this phase
+- **Every channel that reaches the model is an injection channel**, including tool
+  *descriptions*, schema property descriptions and *error text* from a remote MCP server.
+  Self-asserted metadata (`readOnlyHint`) is a claim, not a fact.
+- **Schema validation can be an SSRF primitive**: JSON-Schema `$ref` resolution may fetch
+  URLs. Validate with an empty registry and reject non-local refs.
+- **stdio transports own stdout**: anything else that prints there corrupts the protocol.
+  Logs go to stderr in that mode.
+- **Verify an index is used** (`EXPLAIN`) before benchmarking it, clean up after failures,
+  and run randomized builds more than once.
+- **IdP outage is 503, not 401** (do not log users out), failed refreshes must start a
+  cool-down *after* the attempt, and keys of the wrong type must be filtered before they
+  reach signature code (otherwise an unauthenticated request is a 500).

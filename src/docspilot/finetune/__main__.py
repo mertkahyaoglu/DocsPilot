@@ -20,7 +20,9 @@ from docspilot.finetune.dataset import (
     generate,
     golden_examples,
     label_counts,
+    remove_leaks,
     split_by_template,
+    unique_texts,
 )
 from docspilot.finetune.metrics import Report, evaluate
 from docspilot.local_classifier import LocalIntentClassifier
@@ -90,13 +92,18 @@ def main() -> None:
     ap.add_argument("--base-model", default="distilbert-base-uncased")
     ap.add_argument("--out", type=Path, default=OUT)
     ap.add_argument("--epochs", type=int, default=4)
+    ap.add_argument("--seeds", type=int, default=1, help="LoRA runs with different seeds")
     args = ap.parse_args()
 
     examples = generate()
     train, held = split_by_template(examples)
     golden = golden_examples(GOLDEN)
-    print(f"train={len(train)} {label_counts(train)}")
-    print(f"held-out templates={len(held)}  golden={len(golden)} {label_counts(golden)}")
+    train, leaked = remove_leaks(train, held, golden)
+    print(f"train={len(train)} {label_counts(train)} (removed {leaked} rows that equal test text)")
+    print(
+        f"held-out templates={len(held)} rows / {unique_texts(held)} unique texts; "
+        f"golden={len(golden)} {label_counts(golden)}"
+    )
     if args.cmd == "data":
         return
 
@@ -117,14 +124,31 @@ def main() -> None:
     if args.cmd == "lora" or (args.cmd == "compare" and args.lora):
         from docspilot.finetune.train_lora import train as train_lora
 
-        d = args.out / "lora"
-        t0 = time.perf_counter()
-        stats = train_lora(train, d, base_model=args.base_model, epochs=args.epochs)
-        train_s = time.perf_counter() - t0
-        clf = LocalIntentClassifier.load(d)
-        res = _score("distilbert+lora", clf._predict, test_sets)
-        res.update(train_seconds=round(train_s, 1), artefact_mb=_directory_size_mb(d), **stats)
-        results.append(res)
+        runs: list[dict[str, Any]] = []
+        for seed in range(args.seeds):
+            d = args.out / f"lora-seed{seed}"
+            t0 = time.perf_counter()
+            stats = train_lora(
+                train, d, base_model=args.base_model, epochs=args.epochs, seed=3 + seed
+            )
+            train_s = time.perf_counter() - t0
+            clf = LocalIntentClassifier.load(d)
+            res = _score(f"distilbert+lora(seed={3 + seed})", clf.raw_label, test_sets)
+            res.update(train_seconds=round(train_s, 1), artefact_mb=_directory_size_mb(d), **stats)
+            runs.append(res)
+            results.append(res)
+        if len(runs) > 1:
+            summary: dict[str, Any] = {"name": f"distilbert+lora mean/sd over {len(runs)} seeds"}
+            for set_name in test_sets:
+                accs = [r[set_name]["accuracy"] for r in runs]
+                f1s = [r[set_name]["macro_f1"] for r in runs]
+                summary[set_name] = {
+                    "accuracy_mean": round(statistics.mean(accs), 3),
+                    "accuracy_sd": round(statistics.stdev(accs), 3),
+                    "macro_f1_mean": round(statistics.mean(f1s), 3),
+                    "macro_f1_sd": round(statistics.stdev(f1s), 3),
+                }
+            results.append(summary)
 
     if args.llm:
         results.append(asyncio.run(_llm_baseline(test_sets)))
@@ -132,7 +156,6 @@ def main() -> None:
     args.out.mkdir(parents=True, exist_ok=True)
     (args.out / "results.json").write_text(json.dumps(results, indent=2))
     print(json.dumps(results, indent=2))
-    _ = statistics
 
 
 if __name__ == "__main__":

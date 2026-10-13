@@ -62,6 +62,18 @@ class TfidfLinear:
         s = self.scores(text)
         return self.labels[max(range(len(s)), key=s.__getitem__)]
 
+    def predict_with_confidence(self, text: str) -> tuple[str, float]:
+        """(label, softmax probability). Probability 0.0 when no known feature matched:
+        a document of unseen words has no evidence, whatever the intercept says."""
+        feats = [g for g in ngrams(tokenize(text), self.ngram_max) if g in self.vocab]
+        if not feats:
+            return self.labels[0], 0.0
+        s = self.scores(text)
+        top = max(s)
+        exps = [math.exp(v - top) for v in s]
+        best = max(range(len(s)), key=s.__getitem__)
+        return self.labels[best], exps[best] / sum(exps)
+
     def to_json(self) -> dict[str, Any]:
         return {
             "vocab": self.vocab,
@@ -77,10 +89,26 @@ class TfidfLinear:
         return cls(**data)
 
 
+#: Below this the model is guessing: say "other" (which routes to the default specialist).
+MIN_CONFIDENCE = 0.5
+#: Misrouting a question to the ticketing specialist is a hard failure for the user
+#: (it cannot search the docs), so that label needs stronger evidence.
+MIN_TICKET_CONFIDENCE = 0.75
+
+
 class LocalIntentClassifier:
-    def __init__(self, name: str, predict: Any) -> None:
+    def __init__(
+        self,
+        name: str,
+        predict: Any,
+        *,
+        min_confidence: float = MIN_CONFIDENCE,
+        min_ticket_confidence: float = MIN_TICKET_CONFIDENCE,
+    ) -> None:
         self.name = name
-        self._predict = predict  # str -> label (blocking)
+        self._predict = predict  # str -> (label, confidence)   (blocking)
+        self._min = min_confidence
+        self._min_ticket = min_ticket_confidence
 
     @classmethod
     def load(cls, directory: Path) -> LocalIntentClassifier:
@@ -88,15 +116,24 @@ class LocalIntentClassifier:
         kind = meta["kind"]
         if kind == "tfidf":
             model = TfidfLinear.from_json(json.loads((directory / "model.json").read_text()))
-            return cls(f"local:tfidf:{directory.name}", model.predict)
+            return cls(f"local:tfidf:{directory.name}", model.predict_with_confidence)
         if kind == "transformers":
             return cls(f"local:transformers:{directory.name}", _load_transformers(directory))
         raise ValueError(f"unknown classifier kind {kind!r}")
 
+    def raw_label(self, message: str) -> str:
+        """The model's argmax with no confidence handling (for offline evaluation)."""
+        return str(self._predict(message)[0])
+
     async def classify(self, message: str) -> Intent:
         # Inference is CPU-bound: keep it off the event loop.
-        label = await asyncio.to_thread(self._predict, message)
-        return label if label in INTENTS else "other"
+        label, confidence = await asyncio.to_thread(self._predict, message)
+        known = next((i for i in INTENTS if i == label), None)
+        if known is None or confidence < self._min:
+            return "other"
+        if known == "ticket_request" and confidence < self._min_ticket:
+            return "question"
+        return known
 
 
 def _load_transformers(directory: Path) -> Any:
@@ -107,10 +144,11 @@ def _load_transformers(directory: Path) -> Any:
     model = AutoModelForSequenceClassification.from_pretrained(directory).eval()
     id2label = {int(k): v for k, v in model.config.id2label.items()}
 
-    def predict(text: str) -> str:
+    def predict(text: str) -> tuple[str, float]:
         enc = tok(text, truncation=True, max_length=128, return_tensors="pt")
         with torch.no_grad():
-            logits = model(**enc).logits[0]
-        return str(id2label[int(logits.argmax())])
+            probs = torch.softmax(model(**enc).logits[0], dim=-1)
+        best = int(probs.argmax())
+        return str(id2label[best]), float(probs[best])
 
     return predict

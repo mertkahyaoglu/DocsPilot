@@ -345,6 +345,25 @@ def _safe_path(path: str) -> str:
     return _PATH_OK.sub("_", path)[:200]
 
 
+class HandoffInput(ToolInput):
+    pass
+
+
+class HandoffToDocsTool(Tool):
+    """Lets the ticketing specialist hand a misrouted product question back. The
+    orchestrator intercepts the call: this tool never actually executes."""
+
+    name = "hand_off_to_docs"
+    description = (
+        "Call this, with no text before it, when the user's message is a product question "
+        "that needs the documentation rather than a ticket (you cannot search the docs)."
+    )
+    input_model = HandoffInput
+
+    async def run(self, args: Any, ctx: ToolContext) -> dict[str, Any]:  # pragma: no cover
+        return {"handoff": "docs"}
+
+
 def default_tools(
     retriever: Retriever | None = None,
     *,

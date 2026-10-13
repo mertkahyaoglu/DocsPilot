@@ -214,6 +214,24 @@ def generate(per_class: int = 140, seed: int = 7) -> list[Example]:
     return out
 
 
+def _norm(text: str) -> str:
+    return " ".join(text.lower().replace("!", "").replace("?", "").replace(".", "").split())
+
+
+def remove_leaks(
+    train: list[Example], *evaluation_sets: list[Example]
+) -> tuple[list[Example], int]:
+    """Drop training rows whose normalised text also appears in any evaluation set, and
+    return how many were removed. Exact string overlap is the cheapest leak to prevent."""
+    banned = {_norm(e.text) for ds in evaluation_sets for e in ds}
+    kept = [e for e in train if _norm(e.text) not in banned]
+    return kept, len(train) - len(kept)
+
+
+def unique_texts(examples: list[Example]) -> int:
+    return len({_norm(e.text) for e in examples})
+
+
 def split_by_template(
     examples: list[Example], holdout_fraction: float = 0.3, seed: int = 11
 ) -> tuple[list[Example], list[Example]]:

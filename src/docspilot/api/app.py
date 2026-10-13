@@ -114,6 +114,9 @@ def create_app(
                 stack.push_async_callback(oidc.aclose)
             keys = parse_api_keys(settings.api_keys.get_secret_value()) if settings.api_keys else {}
             app.state.authenticator = ChainAuthenticator(oidc, ApiKeyAuthenticator(keys))
+            if settings.strict and not app.state.authenticator.required:
+                # e.g. API_KEYS="," parses to no keys: never serve everyone as anonymous
+                raise RuntimeError("authentication is required outside dev/test but none works")
             app.state.rate_limiter = RateLimiter(
                 per_minute=settings.rate_limit_per_min, burst=settings.rate_limit_burst
             )
@@ -152,6 +155,16 @@ def create_app(
                 )
             app.state.intent_classifier = classifier
             if settings.architecture == "multi":
+                if settings.routing:
+                    log.warning(
+                        "routing_ignored_in_multi",
+                        note="the orchestrator already classifies; DOCSPILOT_ROUTING has no effect",
+                    )
+                if settings.mcp_servers:
+                    log.warning(
+                        "mcp_servers_ignored_in_multi",
+                        note="external tools are only attached to the single agent",
+                    )
                 docs_prompt = registry.get("agent_docs")
                 app.state.agent = build_orchestrator(
                     settings,
@@ -169,7 +182,11 @@ def create_app(
                 for name, target in parse_server_specs(settings.mcp_servers):
                     mcp_client = await stack.enter_async_context(client_for(target))
                     external += await load_remote_tools(
-                        mcp_client, server_name=name, policy=settings.injection_policy
+                        mcp_client,
+                        server_name=name,
+                        policy=settings.injection_policy,
+                        trust_read_only=settings.mcp_trust_read_only,
+                        taken_names={t.name for t in external},
                     )
                     log.info("mcp_server_connected", server=name, tools=len(external))
                 app.state.agent = build_agent(
