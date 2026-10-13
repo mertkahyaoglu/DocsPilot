@@ -46,3 +46,34 @@ async def test_embedding_model_change_forces_reembed(tmp_path: Path) -> None:
     await ingest_corpus(tmp_path, store, HashEmbedder())
     report = await ingest_corpus(tmp_path, store, Other())
     assert report.added_or_updated == ["a.md"]
+
+
+async def test_missing_or_empty_corpus_never_wipes_the_index(tmp_path: Path) -> None:
+    import pytest
+
+    from docspilot.rag.ingest import CorpusError
+
+    store, emb = InMemoryChunkStore(), HashEmbedder()
+    write(tmp_path, "a.md", "A")
+    await ingest_corpus(tmp_path, store, emb)
+
+    with pytest.raises(CorpusError, match="not found"):
+        await ingest_corpus(tmp_path / "typo", store, emb)
+    empty = tmp_path / "empty"
+    empty.mkdir()
+    with pytest.raises(CorpusError, match="refusing"):
+        await ingest_corpus(empty, store, emb)
+    assert await store.count_chunks() > 0
+    report = await ingest_corpus(empty, store, emb, allow_prune_all=True)
+    assert report.deleted == ["a.md"]
+
+
+async def test_document_that_becomes_empty_is_removed_from_the_index(tmp_path: Path) -> None:
+    store, emb = InMemoryChunkStore(), HashEmbedder()
+    write(tmp_path, "a.md", "A")
+    write(tmp_path, "b.md", "B")
+    await ingest_corpus(tmp_path, store, emb)
+    (tmp_path / "a.md").write_text("---\ntitle: A\n---\n\n<!-- nothing left -->\n")
+    report = await ingest_corpus(tmp_path, store, emb)
+    assert report.deleted == ["a.md"]
+    assert "a.md" not in await store.document_state()

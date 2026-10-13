@@ -199,6 +199,20 @@ the tool description tells it to write self-contained queries.
 - The offline `HashEmbedder` exists so the pipeline runs without keys. It is not a
   quality baseline; prod refuses to start with it.
 
+### Failure modes designed in (found in review)
+- **Ingestion must be safe to run any time**: always incremental at startup (heals a
+  half-finished earlier run and embedding-model switches); refuses a missing/empty
+  corpus instead of "pruning" the whole index; a document that becomes empty is removed.
+- **Retrieval degrades, it does not die**: embedding provider down → keyword only;
+  keyword query error → vector only; reranker down → fused order. Only losing every
+  leg is an error. `/readyz` also fails when stored vectors come from another model.
+- **Tool output stays valid JSON** under any budget: drop whole results, never slice a
+  document; the citation source list is computed from what was actually sent.
+- **Identifiers**: Postgres FTS has no IDF, so `invoice.paid` is indexed as one token
+  and generic words would outrank it. Composite identifiers are matched whole and
+  boosted. HTML comments are stripped at ingest (invisible to readers, favourite
+  hiding place for instructions aimed at models).
+
 ### What breaks in production
 | Symptom | Likely cause | Where to look |
 |---|---|---|

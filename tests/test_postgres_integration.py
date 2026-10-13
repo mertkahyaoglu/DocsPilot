@@ -69,10 +69,14 @@ async def test_ingest_search_and_prune_against_pgvector(dsn: str, tmp_path: Path
         assert kw and kw[0].chunk.path.startswith(("api/webhooks", "troubleshooting/"))
         assert await store.search_keyword("the of and", 5) == []
 
+        # exact dotted identifier outranks documents that merely share generic words
+        ident = await store.search_keyword("invoice.paid event", 3)
+        assert ident[0].chunk.path == "api/webhooks.md"
+
         # pruning removes documents and (via cascade) their chunks
         empty = tmp_path / "empty"
         empty.mkdir()
-        pruned = await ingest_corpus(empty, store, emb)
+        pruned = await ingest_corpus(empty, store, emb, allow_prune_all=True)
         assert len(pruned.deleted) == len(report.added_or_updated)
         assert await store.count_chunks() == 0
     finally:

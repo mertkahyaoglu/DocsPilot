@@ -132,3 +132,52 @@ async def test_readyz_and_debug_search(client: httpx.AsyncClient) -> None:
     body = res.json()
     assert res.status_code == 200 and body["embedder"] == "hash-1024"
     assert body["hits"] and {"vector_rank", "keyword_rank", "fused_score"} <= set(body["hits"][0])
+
+
+async def test_tool_output_is_always_valid_json_and_sources_match() -> None:
+    retriever = await build_retriever(k=20)
+    tool = SearchDocsTool(retriever)
+    tool.char_budget = 2500
+    registry = ToolRegistry([tool])
+    parsed = registry.parse("search_docs", {"query": "refund policy invoices payments webhooks"})
+    t, args = parsed  # type: ignore[misc]
+    out = await registry.execute(t, args, ToolContext("u", InMemoryTicketStore()), timeout_s=5)
+    payload = json.loads(out.content)  # would raise on a chopped-off document
+    assert len(out.content) <= 2500 + 600  # one oversized first result may be shortened
+    assert {s.path for s in out.sources} == {r["source"] for r in payload["results"]}
+
+
+async def test_generic_backstop_truncation_stays_valid_json() -> None:
+    from docspilot.agent.tools import MAX_TOOL_OUTPUT_CHARS, Tool, ToolInput
+
+    class Big(Tool):
+        name = "big"
+        description = "huge output"
+        input_model = ToolInput
+
+        async def run(self, args, ctx):  # type: ignore[no-untyped-def]
+            return {"blob": "x" * (MAX_TOOL_OUTPUT_CHARS * 2)}
+
+    registry = ToolRegistry([Big()])
+    t, args = registry.parse("big", {})  # type: ignore[misc]
+    out = await registry.execute(t, args, ToolContext("u", InMemoryTicketStore()), timeout_s=5)
+    data = json.loads(out.content)
+    assert data["truncated"] is True and len(out.content) <= MAX_TOOL_OUTPUT_CHARS
+
+
+def test_citation_variants_are_parsed() -> None:
+    r = {
+        "a.md": Source("a.md", "A", "A > S"),
+        "dir/b.md": Source("dir/b.md", "B", "B > S"),
+    }
+    text = "x [a.md, dir/b.md] y [a.md#sec] z [source: dir/b.md] w [nope.md]"
+    assert [c.path for c in extract_citations(text, r)] == ["a.md", "dir/b.md"]
+
+
+async def test_readyz_flags_embedding_model_mismatch(app, client: httpx.AsyncClient) -> None:  # type: ignore[no-untyped-def]
+    class Other(HashEmbedder):
+        name = "voyage:other"
+
+    app.state.rag.embedder = Other()
+    res = await client.get("/readyz")
+    assert res.status_code == 503 and res.json()["status"] == "embedding_model_mismatch"

@@ -60,3 +60,43 @@ async def test_empty_or_stopword_only_query_does_not_crash(retriever: Retriever)
     result = await retriever.search("the of and")
     assert result.n_keyword == 0
     assert len(result.hits) <= 5
+
+
+async def test_dotted_identifiers_match_whole_and_in_parts() -> None:
+    from docspilot.rag.store import keyword_terms
+
+    terms = keyword_terms("when does the invoice.paid event fire?")
+    assert "invoice.paid" in terms and "invoice" in terms and "paid" in terms
+    assert keyword_terms("résumé généré") == ["résumé", "généré"]  # unicode survives
+
+
+async def test_retrieval_degrades_instead_of_failing() -> None:
+    class BrokenEmbedder(HashEmbedder):
+        async def embed(self, texts, input_type):  # type: ignore[no-untyped-def]
+            raise RuntimeError("provider down")
+
+    class BrokenReranker(NoopReranker):
+        async def rerank(self, query, hits, top_k):  # type: ignore[no-untyped-def]
+            raise RuntimeError("rerank down")
+
+    store = InMemoryChunkStore()
+    await ingest_corpus(CORPUS, store, HashEmbedder())
+    r = Retriever(store, BrokenEmbedder(), BrokenReranker(), RetrievalConfig(k_final=3))
+    result = await r.search("webhook endpoint disabled after failures")
+    assert result.n_vector == 0 and result.n_keyword > 0  # keyword-only
+    assert 0 < len(result.hits) <= 3  # fused order, no rerank
+
+
+async def test_total_retrieval_failure_is_an_error() -> None:
+    import pytest
+
+    class Dead(InMemoryChunkStore):
+        async def search_vector(self, embedding, k):  # type: ignore[no-untyped-def]
+            raise RuntimeError("db down")
+
+        async def search_keyword(self, query, k):  # type: ignore[no-untyped-def]
+            raise RuntimeError("db down")
+
+    r = Retriever(Dead(), HashEmbedder(), NoopReranker())
+    with pytest.raises(RuntimeError):
+        await r.search("anything")

@@ -112,6 +112,13 @@ def create_app(settings: Settings | None = None, llm: LLM | None = None) -> Fast
             return JSONResponse({"status": "unavailable"}, status_code=503)
         if chunks == 0:
             return JSONResponse({"status": "empty_index"}, status_code=503)
+        current = app.state.rag.embedder.name
+        state = await app.state.rag.store.document_state()
+        stale = sorted(p for p, (_, model) in state.items() if model != current)
+        if stale:  # vectors from another model are incomparable: retrieval would degrade silently
+            return JSONResponse(
+                {"status": "embedding_model_mismatch", "documents": len(stale)}, status_code=503
+            )
         return JSONResponse({"status": "ready", "chunks": chunks})
 
     if settings.web_dir.is_dir():

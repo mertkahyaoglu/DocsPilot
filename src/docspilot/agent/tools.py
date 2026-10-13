@@ -131,7 +131,11 @@ class ToolRegistry:
             return ToolOutcome(f"{tool.name} failed due to an internal error.", True)
         text = json.dumps(output, ensure_ascii=False, default=str)
         if len(text) > MAX_TOOL_OUTPUT_CHARS:
-            text = text[:MAX_TOOL_OUTPUT_CHARS] + '..."[truncated]'
+            # Backstop for tools that did not budget themselves. Stays valid JSON so the
+            # model can tell it was cut; never emit a chopped-off JSON document.
+            preview = text[: MAX_TOOL_OUTPUT_CHARS - 200]
+            text = json.dumps({"truncated": True, "preview": preview}, ensure_ascii=False)
+            return ToolOutcome(text)
         return ToolOutcome(text, sources=tool.sources(output))
 
 
@@ -222,8 +226,9 @@ class SearchDocsTool(Tool):
         "API behaviour). If results look off-topic, call again with a different query."
     )
     input_model = SearchDocsInput
-    #: Max characters of passage text returned: bounds prompt size and cost.
-    char_budget = 6000
+    #: Budget for the *serialised* result (JSON overhead and escaping included), kept
+    #: below MAX_TOOL_OUTPUT_CHARS so the generic backstop never triggers.
+    char_budget = 7000
 
     def __init__(self, retriever: Retriever) -> None:
         self._retriever = retriever
@@ -231,21 +236,22 @@ class SearchDocsTool(Tool):
     async def run(self, args: SearchDocsInput, ctx: ToolContext) -> dict[str, Any]:
         result = await self._retriever.search(args.query)
         results: list[dict[str, Any]] = []
-        used = 0
         for hit in result.hits:  # best first: when the budget runs out the tail is dropped
             c = hit.chunk
-            if results and used + len(c.text) > self.char_budget:
+            item = {
+                "source": c.path,
+                "title": c.title,
+                "section": c.heading_path,
+                "updated": c.updated.isoformat() if c.updated else None,
+                "text": c.text,
+            }
+            if len(json.dumps([*results, item], ensure_ascii=False)) > self.char_budget:
+                if not results:  # even the best chunk alone is too big: shorten its text
+                    room = self.char_budget - len(json.dumps({**item, "text": ""})) - 40
+                    item["text"] = c.text[: max(room, 200)] + " …[truncated]"
+                    results.append(item)
                 break
-            used += len(c.text)
-            results.append(
-                {
-                    "source": c.path,
-                    "title": c.title,
-                    "section": c.heading_path,
-                    "updated": c.updated.isoformat() if c.updated else None,
-                    "text": c.text,
-                }
-            )
+            results.append(item)
         if not results:
             return {"results": [], "note": "No relevant documentation found for this query."}
         return {"results": results}

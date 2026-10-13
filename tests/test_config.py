@@ -46,3 +46,13 @@ def test_blank_key_counts_as_missing(monkeypatch: pytest.MonkeyPatch) -> None:
     with pytest.raises(ValidationError):
         Settings(**PROD)  # type: ignore[arg-type]
     assert Settings(_env_file=None).anthropic_api_key is None  # type: ignore[call-arg]
+
+
+def test_voyage_selection_and_min_score_need_their_prerequisites(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("VOYAGE_API_KEY", raising=False)
+    with pytest.raises(ValidationError, match="VOYAGE_API_KEY"):
+        Settings(embedder="voyage", _env_file=None)  # type: ignore[call-arg]
+    with pytest.raises(ValidationError, match="reranker"):
+        Settings(rerank_min_score=0.3, _env_file=None)  # type: ignore[call-arg]

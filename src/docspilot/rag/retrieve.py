@@ -10,12 +10,14 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass
 
+from docspilot.logging import get_logger
 from docspilot.rag.embeddings import Embedder
 from docspilot.rag.rerank import Reranker
 from docspilot.rag.store import ChunkStore
 from docspilot.rag.types import SearchHit
 
 RRF_K = 60
+log = get_logger("retrieve")
 
 
 @dataclass(frozen=True, slots=True)
@@ -75,17 +77,36 @@ class Retriever:
         self._cfg = config or RetrievalConfig()
 
     async def search(self, query: str) -> RetrievalResult:
+        """Each leg may fail independently: losing the embedding provider degrades to
+        keyword-only, a bad keyword query degrades to vector-only, a rerank outage to the
+        fused order. Only losing *everything* is an error."""
         cfg = self._cfg
-        (embedding,) = await self._embedder.embed([query], "query")
-        vector, keyword = await asyncio.gather(
-            self._store.search_vector(embedding, cfg.k_vector),
-            self._store.search_keyword(query, cfg.k_keyword),
+        vector_task = asyncio.create_task(self._vector(query))
+        keyword_task = asyncio.create_task(self._store.search_keyword(query, cfg.k_keyword))
+        vector_res, keyword_res = await asyncio.gather(
+            vector_task, keyword_task, return_exceptions=True
         )
+        if isinstance(vector_res, BaseException) and isinstance(keyword_res, BaseException):
+            raise vector_res
+        vector = [] if isinstance(vector_res, BaseException) else vector_res
+        keyword = [] if isinstance(keyword_res, BaseException) else keyword_res
+        for leg, res in (("vector", vector_res), ("keyword", keyword_res)):
+            if isinstance(res, BaseException):
+                log.warning("retrieval_leg_failed", leg=leg, error=repr(res))
+
         fused = reciprocal_rank_fusion(vector, keyword)
         candidates = fused[: cfg.n_candidates]
-        final = await self._reranker.rerank(query, candidates, cfg.k_final)
+        try:
+            final = await self._reranker.rerank(query, candidates, cfg.k_final)
+        except Exception as exc:
+            log.warning("rerank_failed_using_fused_order", error=repr(exc))
+            final = candidates[: cfg.k_final]
         if cfg.min_rerank_score is not None:
             final = [
                 h for h in final if h.rerank_score is None or h.rerank_score >= cfg.min_rerank_score
             ]
         return RetrievalResult(final, len(vector), len(keyword), len(candidates))
+
+    async def _vector(self, query: str) -> list[SearchHit]:
+        (embedding,) = await self._embedder.embed([query], "query")
+        return await self._store.search_vector(embedding, self._cfg.k_vector)

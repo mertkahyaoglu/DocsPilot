@@ -32,7 +32,19 @@ def _read_corpus(corpus_dir: Path) -> list[tuple[str, str]]:
     ]
 
 
-async def ingest_corpus(corpus_dir: Path, store: ChunkStore, embedder: Embedder) -> IngestReport:
+class CorpusError(Exception):
+    """Refusing to ingest: the corpus looks wrong (guards against wiping the index)."""
+
+
+async def ingest_corpus(
+    corpus_dir: Path,
+    store: ChunkStore,
+    embedder: Embedder,
+    *,
+    allow_prune_all: bool = False,
+) -> IngestReport:
+    if not await asyncio.to_thread(corpus_dir.is_dir):
+        raise CorpusError(f"corpus directory not found: {corpus_dir}")
     state = await store.document_state()
     seen: set[str] = set()
     changed: list[str] = []
@@ -47,7 +59,9 @@ async def ingest_corpus(corpus_dir: Path, store: ChunkStore, embedder: Embedder)
             continue
         chunks = chunk_markdown(doc)
         if not chunks:
+            # A document that became empty must stop being served.
             log.warning("ingest_empty_document", path=rel)
+            seen.discard(rel)
             continue
         embeddings = await embedder.embed([c.embed_text for c in chunks], "document")
         await store.replace_document(doc, chunks, embeddings, embedder.name)
@@ -55,6 +69,11 @@ async def ingest_corpus(corpus_dir: Path, store: ChunkStore, embedder: Embedder)
         chunks_written += len(chunks)
 
     stale = sorted(set(state) - seen)
+    if state and not seen and not allow_prune_all:
+        raise CorpusError(
+            f"{corpus_dir} has no documents but the index has {len(state)}; "
+            "refusing to delete everything (pass --allow-prune-all to force)"
+        )
     if stale:
         await store.delete_documents(stale)
     report = IngestReport(changed, unchanged, stale, chunks_written)
@@ -68,7 +87,7 @@ async def ingest_corpus(corpus_dir: Path, store: ChunkStore, embedder: Embedder)
     return report
 
 
-async def _cli(corpus: Path) -> None:
+async def _cli(corpus: Path, allow_prune_all: bool) -> None:
     from docspilot.config import get_settings
     from docspilot.logging import configure_logging
     from docspilot.rag.factory import build_rag
@@ -76,7 +95,9 @@ async def _cli(corpus: Path) -> None:
     settings = get_settings()
     configure_logging(settings)
     async with build_rag(settings, ingest_on_start=False) as rag:
-        report = await ingest_corpus(corpus, rag.store, rag.embedder)
+        report = await ingest_corpus(
+            corpus, rag.store, rag.embedder, allow_prune_all=allow_prune_all
+        )
         print(
             f"updated={len(report.added_or_updated)} unchanged={report.unchanged} "
             f"deleted={len(report.deleted)} chunks={report.chunks_written}"
@@ -86,10 +107,11 @@ async def _cli(corpus: Path) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(description="Ingest the docs corpus.")
     parser.add_argument("corpus", type=Path, nargs="?", default=None)
+    parser.add_argument("--allow-prune-all", action="store_true")
     args = parser.parse_args()
     from docspilot.config import get_settings
 
-    asyncio.run(_cli(args.corpus or get_settings().corpus_dir))
+    asyncio.run(_cli(args.corpus or get_settings().corpus_dir, args.allow_prune_all))
 
 
 if __name__ == "__main__":

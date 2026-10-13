@@ -7,16 +7,25 @@ from typing import Protocol
 
 from docspilot.rag.types import ChunkDraft, RawDoc, SearchHit, StoredChunk
 
-_WORD = re.compile(r"[a-z0-9]+")
+# Words, plus dotted/hyphenated/slashed identifiers kept whole ("invoice.paid", "http/1.1").
+_COMPOSITE = re.compile(r"\w+(?:[.\-/]\w+)+")
+_WORD = re.compile(r"\w+")
 _STOP = frozenset(
     "a an and are as at be by can do does for from how i if in is it my of on or our so that "
     "the their there this to was we what when where which who why will with you your".split()
 )
 
 
+def tokenize(text: str) -> list[str]:
+    """Composite identifiers first, then their parts, so both 'invoice.paid' and 'paid'
+    match. Unicode-aware (\\w), lower-cased."""
+    lowered = text.lower()
+    return [*_COMPOSITE.findall(lowered), *_WORD.findall(lowered)]
+
+
 def keyword_terms(text: str) -> list[str]:
     seen: dict[str, None] = {}
-    for w in _WORD.findall(text.lower()):
+    for w in tokenize(text):
         if len(w) > 1 and w not in _STOP:
             seen.setdefault(w)
     return list(seen)[:24]

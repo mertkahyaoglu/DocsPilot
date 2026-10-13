@@ -8,6 +8,7 @@ from psycopg_pool import AsyncConnectionPool
 from docspilot.rag.store import keyword_terms
 from docspilot.rag.types import ChunkDraft, RawDoc, SearchHit, StoredChunk
 
+_SAFE_TERM = re.compile(r"[\w.\-/]+")
 _COLS = "c.id, d.path, d.title, d.category, c.heading_path, c.content, d.updated"
 
 
@@ -89,22 +90,30 @@ class PostgresChunkStore:
         return [SearchHit(chunk=_chunk(r), score=1.0 - float(r[7])) for r in rows]
 
     async def search_keyword(self, query: str, k: int) -> list[SearchHit]:
-        terms = [t for t in keyword_terms(query) if re.fullmatch(r"[a-z0-9]+", t)]
+        terms = [t for t in keyword_terms(query) if _SAFE_TERM.fullmatch(t)]
         if not terms:
             return []
         # OR semantics: natural-language questions rarely contain *all* doc terms.
-        tsquery = " | ".join(terms)
+        # Each term is a quoted lexeme, so 'invoice.paid' matches the token Postgres
+        # indexes for it; the charset check above makes quote-escaping unnecessary.
+        tsquery = " | ".join(f"'{t}'" for t in terms)
+        # Postgres FTS has no IDF: "invoice | event | invoice.paid" would rank generic
+        # words as high as the rare identifier. Boost documents containing the exact
+        # composite identifiers (dotted/hyphenated/slashed) the user typed.
+        composite = " | ".join(f"'{t}'" for t in terms if re.search(r"[.\-/]", t))
         sql = f"""
-            SELECT {_COLS}, ts_rank_cd(c.tsv, q) AS rank
+            SELECT {_COLS},
+                   ts_rank_cd(c.tsv, q) + 5 * ts_rank_cd(c.tsv, qc) AS rank
             FROM chunks c
             JOIN documents d ON d.id = c.document_id,
-                 to_tsquery('english', %s) q
+                 to_tsquery('english', %s) q,
+                 to_tsquery('english', %s) qc
             WHERE c.tsv @@ q
             ORDER BY rank DESC
             LIMIT %s
         """  # noqa: S608
         async with self._pool.connection() as conn:
-            cur = await conn.execute(sql, (tsquery, k))
+            cur = await conn.execute(sql, (tsquery, composite, k))
             rows = await cur.fetchall()
         return [SearchHit(chunk=_chunk(r), score=float(r[7])) for r in rows]
 

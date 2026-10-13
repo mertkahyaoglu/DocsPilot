@@ -19,7 +19,29 @@ from docspilot.rag.types import ChunkDraft, RawDoc
 
 _FRONT_MATTER = re.compile(r"\A---\s*\n(.*?)\n---\s*\n", re.DOTALL)
 _HEADING = re.compile(r"^(#{1,6})\s+(.*?)\s*#*\s*$")
-_FENCE = re.compile(r"^\s*(```|~~~)")
+_FENCE = re.compile(r"^\s{0,3}(`{3,}|~{3,})")
+_COMMENT = re.compile(r"<!--.*?-->", re.DOTALL)
+
+
+class _FenceTracker:
+    """CommonMark-ish fence state: a fence closes only with the same character and at
+    least as many of them, so ~~~ inside ``` (or a 4-backtick fence) is handled."""
+
+    def __init__(self) -> None:
+        self._open: tuple[str, int] | None = None
+
+    def feed(self, line: str) -> bool:
+        """Consume a line; return True if the line is inside (or delimits) a fence."""
+        m = _FENCE.match(line)
+        if self._open is None:
+            if m:
+                self._open = (m.group(1)[0], len(m.group(1)))
+                return True
+            return False
+        if m and m.group(1)[0] == self._open[0] and len(m.group(1)) >= self._open[1]:
+            if not line.strip().strip(self._open[0]):  # closing fences carry no info string
+                self._open = None
+        return True
 
 
 def estimate_tokens(text: str) -> int:
@@ -41,6 +63,9 @@ def parse_markdown_doc(path: str, raw: str) -> RawDoc:
         except ValueError:
             updated = None
     title = str(meta.get("title") or _first_h1(body) or path)
+    # HTML comments are invisible to readers, so they are not part of the document.
+    # (They are also a classic place to hide instructions aimed at the model.)
+    body = _COMMENT.sub("", body)
     return RawDoc(
         path=path,
         title=title,
@@ -63,12 +88,9 @@ def _blocks(lines: list[str]) -> list[str]:
     """Split a section into atomic blocks: paragraphs, lists, tables, fenced code."""
     blocks: list[str] = []
     cur: list[str] = []
-    in_fence = False
+    fence = _FenceTracker()
     for line in lines:
-        if _FENCE.match(line):
-            in_fence = not in_fence
-            cur.append(line)
-            continue
+        in_fence = fence.feed(line)
         if not in_fence and not line.strip():
             if cur:
                 blocks.append("\n".join(cur))
@@ -84,8 +106,17 @@ def _split_oversized(block: str, max_tokens: int) -> list[str]:
     """A single block bigger than max_tokens (huge code block / table): split by lines."""
     if estimate_tokens(block) <= max_tokens:
         return [block]
-    parts, cur = [], []
+    parts: list[str] = []
+    cur: list[str] = []
     for line in block.splitlines():
+        if estimate_tokens(line) > max_tokens:  # one enormous line: fall back to words
+            if cur:
+                parts.append("\n".join(cur))
+                cur = []
+            words = line.split()
+            step = max(1, int(max_tokens / 1.3))
+            parts.extend(" ".join(words[i : i + step]) for i in range(0, len(words), step))
+            continue
         cur.append(line)
         if estimate_tokens("\n".join(cur)) >= max_tokens:
             parts.append("\n".join(cur))
@@ -108,10 +139,9 @@ def chunk_markdown(
     stack: list[tuple[int, str]] = []
     path = doc.title
     cur: list[str] = []
-    in_fence = False
+    fence = _FenceTracker()
     for line in doc.body.splitlines():
-        if _FENCE.match(line):
-            in_fence = not in_fence
+        in_fence = fence.feed(line)
         m = None if in_fence else _HEADING.match(line)
         if m is None:
             cur.append(line)
@@ -134,6 +164,10 @@ def chunk_markdown(
         blocks = [b for blk in _blocks(lines) for b in _split_oversized(blk, max_tokens)]
         if not blocks:
             continue
+        if carry and heading_path != doc.title:
+            # Merged forward under the earlier label: keep this section's own heading
+            # in the text so it is not lost.
+            blocks = [heading_path.split(" > ")[-1], *blocks]
         blocks = carry + blocks
         heading_path = carry_path or heading_path
         if sum(estimate_tokens(b) for b in blocks) < min_tokens:

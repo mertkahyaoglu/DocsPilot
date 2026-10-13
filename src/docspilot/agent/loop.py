@@ -85,16 +85,20 @@ class AgentFinished:
     retrieved: tuple[Source, ...] = ()
 
 
-_CITATION = re.compile(r"\[([A-Za-z0-9_\-./]+\.md)\]")
+_BRACKET = re.compile(r"\[([^\[\]\n]*?\.md[^\[\]\n]*)\]")
 
 
 def extract_citations(text: str, retrieved: dict[str, Source]) -> tuple[Source, ...]:
     """Citations are model output, so they are untrusted: keep only paths that were
     really retrieved this turn. A hallucinated path never reaches the user as a source."""
     out: dict[str, Source] = {}
-    for path in _CITATION.findall(text):
-        if path in retrieved:
-            out.setdefault(path, retrieved[path])
+    for group in _BRACKET.findall(text):
+        # Tolerate "[a.md, b.md]", "[a.md#section]", "[source: a.md]".
+        for part in re.split(r"[;,]", group):
+            path = part.strip().removeprefix("source:").removeprefix("doc:").strip()
+            path = path.split("#", 1)[0].strip()
+            if path in retrieved:
+                out.setdefault(path, retrieved[path])
     return tuple(out.values())
 
 

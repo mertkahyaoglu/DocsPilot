@@ -105,6 +105,10 @@ class Settings(BaseSettings):
             raise ValueError("DATABASE_URL is required when DOCSPILOT_ENV=prod")
         if self.env == "prod" and self.resolved_embedder == "hash":
             raise ValueError("a real embedder (VOYAGE_API_KEY) is required in prod")
+        if "voyage" in (self.embedder, self.rerank) and self.voyage_api_key is None:
+            raise ValueError("VOYAGE_API_KEY is required for embedder/rerank=voyage")
+        if self.rerank_min_score is not None and self.resolved_rerank == "none":
+            raise ValueError("DOCSPILOT_RERANK_MIN_SCORE needs a reranker (it is a rerank score)")
         return self
 
 
