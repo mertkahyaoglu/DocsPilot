@@ -40,6 +40,7 @@ class Source:
     path: str
     title: str
     section: str
+    text: str = ""  # passage shown to the model; used by evals, never sent to API clients
 
 
 @dataclass(frozen=True, slots=True)
@@ -258,7 +259,8 @@ class SearchDocsTool(Tool):
 
     def sources(self, output: dict[str, Any]) -> tuple[Source, ...]:
         return tuple(
-            Source(r["source"], r["title"], r["section"]) for r in output.get("results", [])
+            Source(r["source"], r["title"], r["section"], r.get("text", ""))
+            for r in output.get("results", [])
         )
 
 

@@ -301,7 +301,15 @@ class Agent:
                 yield ToolStart(call.id, call.name, call.input)
             for call, outcome, ms in await self._run_concurrently(runnable, ctx):
                 outcomes[call.id] = outcome
-                retrieved.update({src.path: src for src in outcome.sources})
+                for src in outcome.sources:
+                    prev = retrieved.get(src.path)
+                    if prev is not None and src.text and src.text not in prev.text:
+                        src = Source(
+                            src.path, src.title, src.section, prev.text + "\n\n" + src.text
+                        )
+                    elif prev is not None:
+                        src = prev
+                    retrieved[src.path] = src
                 yield ToolEnd(call.id, call.name, outcome.is_error, ms)
 
             if awaiting:

@@ -54,6 +54,7 @@ class Settings(BaseSettings):
     # Main answer model vs. cheap model for classification / judging.
     model_answer: str = "claude-opus-5-5"
     model_light: str = "claude-haiku-5-5"
+    model_judge: str = "claude-sonnet-5-5"  # evals only; judge quality matters more than cost
     effort_answer: Effort = "medium"
     max_tokens: int = Field(default=16000, ge=256)
 
