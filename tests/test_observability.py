@@ -343,7 +343,7 @@ async def test_routing_sends_real_questions_to_the_agent_and_fails_open(
     res = await client.post("/v1/chat", json=BODY)
     await close(gen)
     assert parse_sse(res.text)[-1][1]["model"] == "claude-opus-5-5"
-    assert [r.purpose for r in llm.requests][0] == "route"
+    assert llm.requests[0].purpose == "route"
 
     def broken(req: LLMRequest) -> Script:
         if req.purpose == "route":
