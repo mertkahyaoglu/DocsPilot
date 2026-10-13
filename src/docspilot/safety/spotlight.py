@@ -27,3 +27,8 @@ def wrap(text: str, nonce: str) -> str:
 def unwrap(wrapped: str) -> str:
     m = _WRAPPED.fullmatch(wrapped)
     return m.group(1) if m else wrapped
+
+
+def defang(text: str) -> str:
+    """Neutralise delimiter-like sequences in a short field (title, section)."""
+    return _FORGERY.sub(_defang, text)

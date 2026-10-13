@@ -49,10 +49,11 @@ async def current_user_id(
     return user_id
 
 
-async def enforce_budget(request: Request, user_id: str) -> None:
+async def enforce_budget(request: Request, user_id: str) -> float:
+    """Reserve worst-case spend for this request; returns the reserved amount."""
     budget: Budget = request.app.state.budget
     try:
-        await budget.check(user_id)
+        return await budget.reserve(user_id)
     except BudgetExceeded as exc:
         request.app.state.telemetry.metrics.rejections.labels(f"budget_{exc.scope}").inc()
         raise HTTPException(

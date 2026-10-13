@@ -10,6 +10,8 @@ import hmac
 from dataclasses import dataclass
 from typing import Protocol
 
+from docspilot.budget import RESERVED_IDS
+
 
 @dataclass(frozen=True, slots=True)
 class Principal:
@@ -58,5 +60,10 @@ def parse_api_keys(spec: str) -> dict[str, str]:
         user, sep, key = part.partition(":")
         if not sep or not user.strip() or len(key.strip()) < 16:
             raise ValueError("API_KEYS entries must be 'user:key' with keys of 16+ characters")
-        keys[user.strip()] = key.strip()
+        user, key = user.strip(), key.strip()
+        if user in RESERVED_IDS:
+            raise ValueError(f"API_KEYS user id {user!r} is reserved")
+        if user in keys or key in keys.values():
+            raise ValueError("API_KEYS contains a duplicate user or key")
+        keys[user] = key
     return keys

@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field, replace
@@ -16,7 +17,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from docspilot.logging import get_logger
 from docspilot.rag.retrieve import Retriever
 from docspilot.safety.injection import Policy, neutralize
-from docspilot.safety.spotlight import new_nonce, unwrap, wrap
+from docspilot.safety.spotlight import defang, new_nonce, unwrap, wrap
 from docspilot.telemetry import Telemetry
 from docspilot.tickets import Severity, TicketStore
 
@@ -295,10 +296,22 @@ class SearchDocsTool(Tool):
                 ctx.flags.add(
                     "injection_removed" if self._policy == "redact" else "suspected_injection"
                 )
+            # Titles and headings are document text too (they live outside the chunk
+            # body): same scan/neutralise/defang before they reach the model.
+            title, t_findings = neutralize(c.title, self._policy)
+            section, s_findings = neutralize(c.heading_path, self._policy)
+            if t_findings or s_findings:
+                self._tel.metrics.injection.labels(self._policy).inc(
+                    len(t_findings) + len(s_findings)
+                )
+                log.warning("injection_suspected", path=c.path, field="title/section")
+                ctx.flags.add(
+                    "injection_removed" if self._policy == "redact" else "suspected_injection"
+                )
             item = {
-                "source": c.path,
-                "title": c.title,
-                "section": c.heading_path,
+                "source": _safe_path(c.path),
+                "title": defang(title)[:200],
+                "section": defang(section)[:300],
                 "updated": c.updated.isoformat() if c.updated else None,
                 "text": wrap(text, ctx.nonce),
             }
@@ -320,6 +333,14 @@ class SearchDocsTool(Tool):
             )
             for r in output.get("results", [])
         )
+
+
+_PATH_OK = re.compile(r"[^A-Za-z0-9_\-./]")
+
+
+def _safe_path(path: str) -> str:
+    """Paths are cited back verbatim, so they must be inert: no spaces/markup/unicode."""
+    return _PATH_OK.sub("_", path)[:200]
 
 
 def default_tools(

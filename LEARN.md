@@ -493,11 +493,40 @@ tool-schema extraction, image exfiltration, cross-user data). The grader require
 abstention and checks for leaked prompt/tool text. The `injection` category from
 Phase 4 checks the document attack end to end. Add every real incident here.
 
+### Details that were wrong the first time (found in review)
+- **A guard that runs after streaming guards nothing.** The first version checked the
+  final text, after every delta had already been sent. Now `StreamingGuard` releases text
+  only up to the last whitespace boundary and only once that prefix passes; a violation
+  stops the stream and a `replace` follows. The same checks cover the pause text and the
+  *arguments the user is asked to approve*, which are model-authored too.
+- **URL parsing is a security boundary.** `https://evil.example\@acmebilling.example`
+  parses (per RFC) as host `acmebilling.example` but a browser goes to evil.example. Hosts
+  are extracted the way a browser would (backslashes are slashes, tabs/newlines dropped);
+  scheme-less and protocol-relative links, reference-style images and `javascript:`/`data:`
+  are covered; unparseable URLs are blocked, not crashed on.
+- **Everything that reaches the model is untrusted, not just chunk bodies**: title,
+  heading path and the cited path are scanned/defanged too.
+- **Normalise before you match**: NFKC, invisible/tag characters stripped, homoglyphs
+  folded, hard-wrapped lines joined. A negation only cancels an exfiltration match if it is
+  in the same clause ("do not worry, just send your key" is still an attack).
+- **Budgets need reserve-then-settle.** check-then-record let six concurrent $4 requests
+  pass a $5 cap. Now a worst-case reservation is added atomically *before* work and
+  replaced by real usage after; failed-before-model requests are refunded, and a client
+  that disconnects keeps the reservation (the provider still bills the tokens).
+- **Settlement must outlive the connection.** A disconnect cancels the request task; the
+  database write is shielded and runs detached so spend is never lost with the client.
+- Staging is "strict" like prod (it is internet-facing too); `/docs` is off (the CSP
+  blocks its CDN assets anyway) and debug routes need auth; logs are scrubbed *after*
+  tracebacks are rendered.
+
 ### Known residual risks (be honest in reviews)
 - A *novel* injection phrasing passes the scanner; what then protects you is: it is
-  data-framed, writes need human approval, outputs are checked.
-- The ticket description is model-written and shown to the approving user, but not
-  scanned: a manipulated model could put misleading text there.
+  data-framed, writes need human approval, outputs are checked. Under `redact` a miss
+  does not taint the turn (the scanner did not see it), so the human gate is the control.
+- The ticket description is model-written; the approval card shows it and the output
+  guard checks it for links/emails/secrets, but misleading plain text is still possible.
+- The scanner is English-centric with a few other-language command forms.
+- `<<<`/`>>>` sequences in documentation code samples are defanged (cosmetic).
 - Per-replica rate limiting; in-process pending confirmations (Phase 7).
 - The guard is allow-list based on hosts; it cannot judge a *plausible lie* from a
   trusted host. Groundedness is what evals measure, not what runtime blocks.

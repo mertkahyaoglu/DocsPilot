@@ -27,7 +27,7 @@ class Settings(BaseSettings):
         populate_by_name=True,
     )
 
-    env: Literal["dev", "test", "prod"] = "dev"
+    env: Literal["dev", "test", "staging", "prod"] = "dev"
     log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR"] = "INFO"
     log_json: bool = False
 
@@ -48,6 +48,8 @@ class Settings(BaseSettings):
     rate_limit_burst: float = Field(default=10.0, ge=1)
     user_daily_budget_usd: float = Field(default=5.0, ge=0)  # 0 disables
     global_daily_budget_usd: float = Field(default=100.0, ge=0)
+    #: Worst-case spend assumed per request until its real usage is known.
+    budget_reserve_usd: float = Field(default=0.25, ge=0)
 
     # --- observability ---
     otlp_endpoint: str | None = Field(default=None, validation_alias="OTEL_EXPORTER_OTLP_ENDPOINT")
@@ -104,6 +106,11 @@ class Settings(BaseSettings):
     max_body_bytes: int = Field(default=256 * 1024, ge=1024)
 
     @property
+    def strict(self) -> bool:
+        """Staging and prod are internet-facing: guard rails cannot be switched off."""
+        return self.env in ("staging", "prod")
+
+    @property
     def allowed_host_list(self) -> tuple[str, ...]:
         return tuple(h.strip().lower() for h in self.allowed_hosts.split(",") if h.strip())
 
@@ -145,10 +152,17 @@ class Settings(BaseSettings):
             raise ValueError("DATABASE_URL is required when DOCSPILOT_ENV=prod")
         if self.env == "prod" and self.resolved_embedder == "hash":
             raise ValueError("a real embedder (VOYAGE_API_KEY) is required in prod")
-        if self.env == "prod" and self.api_keys is None:
-            raise ValueError("DOCSPILOT_API_KEYS is required when DOCSPILOT_ENV=prod")
-        if self.env == "prod" and self.injection_policy == "off":
-            raise ValueError("DOCSPILOT_INJECTION_POLICY must not be 'off' in prod")
+        if self.strict:
+            if self.api_keys is None:
+                raise ValueError("DOCSPILOT_API_KEYS is required outside dev/test")
+            if self.injection_policy == "off":
+                raise ValueError("DOCSPILOT_INJECTION_POLICY must not be 'off' outside dev/test")
+            if not self.output_guard:
+                raise ValueError("DOCSPILOT_OUTPUT_GUARD must stay enabled outside dev/test")
+            if self.rate_limit_per_min <= 0:
+                raise ValueError("a rate limit is required outside dev/test")
+            if self.user_daily_budget_usd <= 0 or self.global_daily_budget_usd <= 0:
+                raise ValueError("daily budgets are required outside dev/test")
         if "voyage" in (self.embedder, self.rerank) and self.voyage_api_key is None:
             raise ValueError("VOYAGE_API_KEY is required for embedder/rerank=voyage")
         if self.rerank_min_score is not None and self.resolved_rerank == "none":

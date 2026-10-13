@@ -5,11 +5,12 @@ from __future__ import annotations
 
 from typing import Annotated, Any
 
-from fastapi import APIRouter, Query, Request
+from fastapi import APIRouter, Depends, Query, Request
 
+from docspilot.api.deps import current_user_id
 from docspilot.rag.factory import RagStack
 
-router = APIRouter(prefix="/v1/debug", tags=["debug"])
+router = APIRouter(prefix="/v1/debug", tags=["debug"], dependencies=[Depends(current_user_id)])
 
 
 @router.get("/search")

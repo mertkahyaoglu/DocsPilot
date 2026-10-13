@@ -36,9 +36,19 @@ def _redact_values(
     """Logs outlive requests and travel to third parties: scrub free-text values (error
     details, queries, exception text) of emails, secrets, card/phone/IBAN numbers."""
     for key, value in event_dict.items():
-        if key not in _STRUCTURAL and isinstance(value, str):
-            event_dict[key] = redact(value)
+        if key not in _STRUCTURAL:
+            event_dict[key] = _scrub(value)
     return event_dict
+
+
+def _scrub(value: Any) -> Any:
+    if isinstance(value, str):
+        return redact(value)
+    if isinstance(value, list | tuple):
+        return [_scrub(v) for v in value]
+    if isinstance(value, dict):
+        return {k: _scrub(v) for k, v in value.items()}
+    return value
 
 
 def configure_logging(settings: Settings) -> None:
@@ -46,7 +56,6 @@ def configure_logging(settings: Settings) -> None:
     shared: list[Processor] = [
         structlog.contextvars.merge_contextvars,
         _add_trace_ids,
-        _redact_values,
         structlog.processors.add_log_level,
         structlog.processors.TimeStamper(fmt="iso", utc=True),
     ]
@@ -56,7 +65,13 @@ def configure_logging(settings: Settings) -> None:
         else structlog.dev.ConsoleRenderer()
     )
     structlog.configure(
-        processors=[*shared, structlog.processors.format_exc_info, renderer],
+        # exc_info is rendered to text *before* scrubbing so tracebacks are covered too
+        processors=[
+            *shared,
+            structlog.processors.format_exc_info,
+            _redact_values,
+            renderer,
+        ],
         wrapper_class=structlog.make_filtering_bound_logger(level),
         logger_factory=structlog.PrintLoggerFactory(file=sys.stdout),
         cache_logger_on_first_use=True,

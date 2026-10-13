@@ -94,7 +94,14 @@ def create_app(
                 spend,
                 user_daily_usd=settings.user_daily_budget_usd,
                 global_daily_usd=settings.global_daily_budget_usd,
+                reserve_usd=settings.budget_reserve_usd,
             )
+            if not app.state.authenticator.required:
+                log.warning(
+                    "auth_disabled",
+                    note="DOCSPILOT_API_KEYS is unset: every caller is 'anonymous' (dev only)",
+                    env=settings.env,
+                )
             app.state.feedback = rag.feedback
             app.state.pending = InMemoryPendingStore(ttl_s=settings.confirmation_ttl_s)
             rag.retriever.attach_telemetry(telemetry)
@@ -122,14 +129,16 @@ def create_app(
             )
             yield
 
-    prod = settings.env == "prod"
+    prod = settings.strict
     app = FastAPI(
         title="DocsPilot",
         version=__version__,
         lifespan=lifespan,
-        docs_url=None if prod else "/docs",
+        # The strict CSP also blocks Swagger's CDN assets, so interactive docs are off;
+        # the schema itself is available outside strict environments.
+        docs_url=None,
         redoc_url=None,
-        openapi_url=None if prod else "/openapi.json",
+        openapi_url=None if settings.strict else "/openapi.json",
     )
     app.add_middleware(BodySizeLimitMiddleware, max_bytes=settings.max_body_bytes)
     app.add_middleware(SecurityHeadersMiddleware)
@@ -151,8 +160,8 @@ def create_app(
         @app.get("/metrics", include_in_schema=False)
         async def metrics(request: Request) -> Response:
             if token is not None:
-                supplied = request.headers.get("authorization", "")
-                if not secrets.compare_digest(supplied, f"Bearer {token}"):
+                supplied = request.headers.get("authorization", "").encode()
+                if not secrets.compare_digest(supplied, f"Bearer {token}".encode()):
                     return Response(status_code=401, headers={"WWW-Authenticate": "Bearer"})
             return Response(
                 generate_latest(app.state.telemetry.metrics.registry),
