@@ -43,6 +43,8 @@ class Settings(BaseSettings):
     service_name: str = "docspilot"
     trace_content: bool = False  # prompts/answers in traces: redacted + truncated, opt-in
     metrics_enabled: bool = True
+    #: Bearer token required for /metrics. In prod the endpoint stays off without one.
+    metrics_token: SecretStr | None = None
 
     # --- cost controls ---
     prompt_caching: bool = True
@@ -102,7 +104,12 @@ class Settings(BaseSettings):
         return self.rerank
 
     @field_validator(
-        "anthropic_api_key", "voyage_api_key", "database_url", "otlp_endpoint", mode="before"
+        "anthropic_api_key",
+        "voyage_api_key",
+        "database_url",
+        "otlp_endpoint",
+        "metrics_token",
+        mode="before",
     )
     @classmethod
     def _blank_key_is_none(cls, v: object) -> object:

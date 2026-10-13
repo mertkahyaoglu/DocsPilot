@@ -29,13 +29,22 @@ async def choose_route(llm: LLM, *, message: str, triage_prompt: str, model: str
     except (TriageError, LLMError):
         log.warning("routing_failed_open")
         return "agent"
-    return route_for(result)
+    except Exception:
+        log.exception("routing_crashed_failed_open")
+        return "agent"
+    return route_for(result, message)
 
 
-def route_for(t: Triage) -> Route:
-    # Only the unambiguous case is diverted. A bare "yes" or "thanks" after a ticket
-    # offer is why this is only ever consulted on the first turn of a conversation.
-    return "smalltalk" if t.intent == "smalltalk" else "agent"
+MAX_SMALLTALK_CHARS = 160
+
+
+def route_for(t: Triage, message: str) -> Route:
+    # Only the unambiguous case is diverted: classified small talk AND short. A long
+    # message that mixes a greeting with a real request ("thanks! also open a ticket
+    # about...") must reach the agent, which has the tools.
+    if t.intent == "smalltalk" and len(message) <= MAX_SMALLTALK_CHARS:
+        return "smalltalk"
+    return "agent"
 
 
 async def smalltalk_events(

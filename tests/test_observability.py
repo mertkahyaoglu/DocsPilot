@@ -8,6 +8,7 @@ import httpx
 import pytest
 from fastapi import FastAPI
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+from pydantic import SecretStr
 
 from docspilot.api.app import create_app
 from docspilot.cache import CachedAnswer, ResponseCache, cache_key, corpus_version, normalize
@@ -252,30 +253,84 @@ async def test_identical_first_turn_question_is_served_from_cache(settings: Sett
     assert 'docspilot_cache_requests_total{result="hit"} 1.0' in metrics
 
 
-async def test_only_single_turn_read_only_complete_answers_are_cached(
-    settings: Settings,
-) -> None:
+async def test_user_specific_tool_turns_are_not_cached(settings: Settings) -> None:
     def script(req: LLMRequest) -> Script:
         last = req.messages[-1]
         if last["role"] == "user" and isinstance(last["content"], list):
-            return Script(text="Your ticket is open.")
+            return Script(text="No such ticket.")
         return Script(tool_calls=[ToolCall("g", "get_ticket", {"ticket_id": "TCK-00000000"})])
 
-    llm = FakeLLM(script)
-    app, client, gen = await open_client(settings, llm)
-    await client.post("/v1/chat", json=BODY)  # used get_ticket: user-specific
+    app, client, gen = await open_client(settings, FakeLLM(script))
+    await client.post("/v1/chat", json=BODY)
+    await close(gen)
     assert len(app.state.response_cache) == 0
 
+
+async def test_follow_up_turns_are_not_cached_even_when_search_only(settings: Settings) -> None:
+    app, client, gen = await open_client(settings, FakeLLM(base_script))
     multi = {
         "messages": [
             {"role": "user", "content": "hi"},
             {"role": "assistant", "content": "hello"},
-            {"role": "user", "content": "refund window?"},
+            {"role": "user", "content": "How long is the refund window?"},
         ]
     }
-    await client.post("/v1/chat", json=multi)
-    assert len(app.state.response_cache) == 0
+    res = await client.post("/v1/chat", json=multi)
+    assert parse_sse(res.text)[-1][0] == "done"
+    # same script, first turn: this *would* be cached, so the multi-turn rule is what held
+    await client.post("/v1/chat", json=BODY)
     await close(gen)
+    assert len(app.state.response_cache) == 1
+
+
+async def test_answers_built_on_failed_or_degraded_retrieval_are_never_cached(
+    settings: Settings,
+) -> None:
+    app, client, gen = await open_client(settings, FakeLLM(base_script))
+    store = app.state.rag.store
+    real_vec, real_kw = store.search_vector, store.search_keyword
+
+    async def boom(*a: Any, **k: Any) -> Any:
+        raise RuntimeError("db blip")
+
+    # 1) one leg down: results are usable but degraded
+    store.search_vector = boom
+    await client.post("/v1/chat", json=BODY)
+    assert len(app.state.response_cache) == 0
+    # 2) both legs down: the tool errors, the model apologises
+    store.search_keyword = boom
+    res = await client.post("/v1/chat", json=BODY)
+    assert parse_sse(res.text)[-1][0] == "done"
+    assert len(app.state.response_cache) == 0
+    # 3) healthy again: now it is cacheable
+    store.search_vector, store.search_keyword = real_vec, real_kw
+    await client.post("/v1/chat", json=BODY)
+    assert len(app.state.response_cache) == 1
+    await close(gen)
+
+
+async def test_answers_without_any_search_are_not_cached(settings: Settings) -> None:
+    app, client, gen = await open_client(settings, FakeLLM([Script(text="I think it is 30 days.")]))
+    await client.post("/v1/chat", json=BODY)
+    await close(gen)
+    assert len(app.state.response_cache) == 0
+
+
+async def test_corpus_version_provider_picks_up_reingest_without_restart() -> None:
+    from docspilot.cache import CorpusVersionProvider
+
+    now = [0.0]
+    state = {"a.md": ("h1", "m")}
+
+    async def fetch() -> dict[str, tuple[str, str]]:
+        return dict(state)
+
+    provider = CorpusVersionProvider(fetch, refresh_s=30, clock=lambda: now[0])
+    v1 = await provider.get()
+    state["a.md"] = ("h2", "m")  # another process re-ingested
+    assert await provider.get() == v1  # within the refresh window
+    now[0] = 31.0
+    assert await provider.get() != v1
 
 
 def test_cache_key_changes_with_prompt_model_and_corpus() -> None:
@@ -385,3 +440,232 @@ def test_redaction() -> None:
     assert "jane.doe" not in out and "sk-ant" not in out and "4242" not in out
     assert "[email]" in out and "[secret]" in out and "[card]" in out and "[phone]" in out
     assert "1234567890123" in out  # fails Luhn: left alone, not mangled
+
+
+# ---- review round: lifecycle, safety, config --------------------------------------
+
+
+async def test_routed_smalltalk_never_populates_the_shared_cache(settings: Settings) -> None:
+    app, client, gen = await open_client(
+        settings, FakeLLM(routing_script("smalltalk")), routing=True
+    )
+    # a (mis)classified short product question answered by the small model, no tools
+    res = await client.post(
+        "/v1/chat", json={"messages": [{"role": "user", "content": "refund window?"}]}
+    )
+    assert parse_sse(res.text)[-1][1]["model"] == "claude-haiku-5-5"
+    assert len(app.state.response_cache) == 0
+    await close(gen)
+
+
+async def test_long_or_mixed_messages_are_not_diverted_to_smalltalk(settings: Settings) -> None:
+    llm = FakeLLM(routing_script("smalltalk"))
+    _, client, gen = await open_client(settings, llm, routing=True, response_cache_ttl_s=0)
+    long_msg = "thanks! " + "also, please open a ticket about my payout being stuck. " * 5
+    await client.post("/v1/chat", json={"messages": [{"role": "user", "content": long_msg}]})
+    await close(gen)
+    assert "smalltalk" not in [r.purpose for r in llm.requests]
+
+
+async def test_routing_fails_open_on_unexpected_exceptions(settings: Settings) -> None:
+    def script(req: LLMRequest) -> Script:
+        if req.purpose == "route":
+            raise RuntimeError("router bug")
+        return base_script(req)
+
+    _, client, gen = await open_client(
+        settings, FakeLLM(script), routing=True, response_cache_ttl_s=0
+    )
+    res = await client.post("/v1/chat", json=BODY)
+    await close(gen)
+    assert parse_sse(res.text)[-1][0] == "done"
+
+
+async def test_cancellation_is_not_an_error_and_spans_still_end(
+    exporter: InMemorySpanExporter,
+) -> None:
+    from opentelemetry.sdk.trace import TracerProvider
+    from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+
+    from docspilot.llm.instrumented import InstrumentedLLM
+    from docspilot.telemetry import Metrics, Telemetry
+
+    provider = TracerProvider()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    tel = Telemetry(Metrics(), provider.get_tracer("t"))
+    llm = InstrumentedLLM(FakeLLM([Script(text="a long streamed answer " * 5)]), tel)
+
+    gen = llm.stream(LLMRequest(model="claude-opus-5-5", messages=[]))
+    await gen.__anext__()  # first delta, then the client "disconnects"
+    await gen.aclose()
+
+    series = {
+        (s.labels["outcome"]): s.value
+        for metric in tel.metrics.registry.collect()
+        if metric.name == "docspilot_llm_requests"
+        for s in metric.samples
+        if s.name.endswith("_total")
+    }
+    assert series == {"cancelled": 1.0}
+    (span,) = exporter.get_finished_spans()
+    assert span.attributes["docspilot.outcome"] == "cancelled"
+
+
+async def test_sse_wrapper_counts_cancellation_and_releases_in_flight(
+    exporter: InMemorySpanExporter,
+) -> None:
+    from opentelemetry.sdk.trace import TracerProvider
+    from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+
+    from docspilot.api.chat import _to_sse
+    from docspilot.llm.types import TextDelta
+    from docspilot.telemetry import Metrics, Telemetry
+
+    provider = TracerProvider()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    tel = Telemetry(Metrics(), provider.get_tracer("t"))
+
+    async def events():  # type: ignore[no-untyped-def]
+        for i in range(100):
+            yield TextDelta(f"chunk{i}")
+
+    out = _to_sse(events(), "req-1234567890", tel)
+    await out.__anext__()
+    assert tel.metrics.in_flight._value.get() == 1.0
+    await out.aclose()  # disconnect
+    assert tel.metrics.in_flight._value.get() == 0.0
+    assert tel.metrics.requests.labels("cancelled")._value.get() == 1.0
+    assert tel.metrics.requests.labels("error")._value.get() == 0.0
+    (root,) = exporter.get_finished_spans()
+    assert root.name == "chat.request" and root.attributes["docspilot.outcome"] == "cancelled"
+
+
+async def test_error_outcome_sets_root_span_error_once(
+    settings: Settings, exporter: InMemorySpanExporter
+) -> None:
+    err = LLMError("boom", kind="overloaded", status_code=529)
+    _, client, gen = await open_client(settings, FakeLLM([Script(error=err)]), exporter)
+    await client.post("/v1/chat", json=BODY)
+    await close(gen)
+    root = next(s for s in exporter.get_finished_spans() if s.name == "chat.request")
+    assert root.status.status_code.name == "ERROR"
+    assert root.attributes["docspilot.outcome"] == "error_overloaded"
+    llm_span = next(s for s in exporter.get_finished_spans() if s.name == "llm.answer")
+    assert len([e for e in llm_span.events if e.name == "exception"]) == 1
+
+
+async def test_cache_hits_are_visible_in_traces(
+    settings: Settings, exporter: InMemorySpanExporter
+) -> None:
+    _, client, gen = await open_client(settings, FakeLLM(base_script), exporter)
+    await client.post("/v1/chat", json=BODY)
+    exporter.clear()
+    await client.post("/v1/chat", json=BODY)
+    await close(gen)
+    assert [s.name for s in exporter.get_finished_spans()] == ["chat.cache_hit"]
+
+
+async def test_fallback_and_unpriced_models_are_counted() -> None:
+    from docspilot.llm.instrumented import InstrumentedLLM
+    from docspilot.llm.types import LLMResult, Usage
+    from docspilot.telemetry import Telemetry
+
+    class Rescued:
+        async def stream(self, request):  # type: ignore[no-untyped-def]
+            yield LLMResult(
+                "ok", [], "end_turn", Usage(10, 5), "claude-opus-4-8", served_by_fallback=True
+            )
+
+    class Mystery:
+        async def stream(self, request):  # type: ignore[no-untyped-def]
+            yield LLMResult("ok", [], "end_turn", Usage(10, 5), "claude-mystery-9")
+
+    tel = Telemetry.noop()
+    for inner in (Rescued(), Mystery()):
+        async for _ in InstrumentedLLM(inner, tel).stream(  # type: ignore[arg-type]
+            LLMRequest(model="claude-fable-5-1", messages=[])
+        ):
+            pass
+    m = tel.metrics
+    assert m.llm_fallback.labels("claude-fable-5-1", "claude-opus-4-8")._value.get() == 1.0
+    assert m.llm_unpriced.labels("claude-mystery-9")._value.get() == 1.0
+
+
+def test_otlp_headers_are_url_decoded_and_trimmed(monkeypatch: pytest.MonkeyPatch) -> None:
+    from docspilot import telemetry
+
+    seen: dict[str, Any] = {}
+
+    class FakeExporter:
+        def __init__(self, **kwargs: Any) -> None:
+            seen.update(kwargs)
+
+        def export(self, spans: Any) -> Any:  # pragma: no cover
+            return None
+
+        def shutdown(self) -> None: ...
+
+        def force_flush(self, timeout_millis: int = 0) -> bool:
+            return True
+
+    monkeypatch.setattr(telemetry, "OTLPSpanExporter", FakeExporter)
+    cfg = Settings(
+        otlp_endpoint="http://collector:4318/",
+        otlp_headers="authorization=Basic%20abc123, x-team = core",
+        _env_file=None,  # type: ignore[call-arg]
+    )
+    provider = telemetry.setup_tracing(cfg)
+    assert provider is not None
+    assert seen["headers"] == {"authorization": "Basic abc123", "x-team": "core"}
+    assert seen["endpoint"] == "http://collector:4318/v1/traces"
+    provider.shutdown()
+
+
+async def test_metrics_endpoint_requires_the_token_when_configured(settings: Settings) -> None:
+    _, client, gen = await open_client(settings, FakeLLM(), metrics_token=SecretStr("s3cret"))
+    assert (await client.get("/metrics")).status_code == 401
+    assert (
+        await client.get("/metrics", headers={"authorization": "Bearer wrong"})
+    ).status_code == 401
+    ok = await client.get("/metrics", headers={"authorization": "Bearer s3cret"})
+    assert ok.status_code == 200 and "docspilot_" in ok.text
+    await close(gen)
+
+
+def test_metrics_route_is_absent_in_prod_without_a_token(
+    settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test")
+    monkeypatch.setenv("VOYAGE_API_KEY", "pa-test")
+
+    def paths(**kw: Any) -> set[str]:
+        cfg = Settings(
+            env="prod",
+            database_url="postgresql://x/y",
+            _env_file=None,
+            **kw,  # type: ignore[arg-type]
+        )
+        return {getattr(r, "path", "") for r in create_app(cfg, FakeLLM()).routes}
+
+    assert "/metrics" not in paths()
+    assert "/metrics" in paths(metrics_token="t")
+
+
+def test_redaction_covers_common_token_shapes() -> None:
+    cases = {
+        "sk_live_51HxabcDEF123456789": "sk_live",
+        "whsec_abcdefghijklmnop1234": "whsec_",
+        "ghp_abcdefghijklmnopqrstuvwxyz0123456789": "ghp_",
+        "AKIAIOSFODNN7EXAMPLE": "AKIA",
+        "xoxb-123456789012-abcdefghijkl": "xoxb",
+        "authorization: bearer abcdefghijklmnop": "abcdefghijklmnop",
+        "Authorization: Basic dXNlcjpwYXNzd29yZDEyMw==": "dXNlcjpw",
+        "postgres://admin:hunter2pass@db.example.com/x": "hunter2pass",
+        "iban GB82 WEST 1234 5698 7654 32": "WEST 1234",
+        "ssn 078-05-1120": "078-05-1120",
+    }
+    for text, leak in cases.items():
+        assert leak not in redact(text), text
+    assert (
+        redact("invoice INV-2024-0042 total $1,240.00") == "invoice INV-2024-0042 total $1,240.00"
+    )

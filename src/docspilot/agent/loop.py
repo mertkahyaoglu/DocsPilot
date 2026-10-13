@@ -83,6 +83,8 @@ class AgentFinished:
     citations: tuple[Source, ...] = ()
     #: Everything retrieved this turn (cited or not), for evals and debugging.
     retrieved: tuple[Source, ...] = ()
+    #: Tool-reported conditions of the turn, e.g. "degraded_retrieval".
+    flags: tuple[str, ...] = ()
 
 
 _BRACKET = re.compile(r"\[([^\[\]\n]*?\.md[^\[\]\n]*)\]")
@@ -268,6 +270,7 @@ class Agent:
                     served_by_fallback=result.served_by_fallback,
                     citations=extract_citations(result.text, retrieved),
                     retrieved=tuple(retrieved.values()),
+                    flags=tuple(sorted(ctx.flags)),
                 )
                 return
 

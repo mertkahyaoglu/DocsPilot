@@ -42,6 +42,9 @@ class RetrievalResult:
     n_vector: int
     n_keyword: int
     n_candidates: int
+    #: A retrieval leg or the reranker failed: results are usable but second-rate, so
+    #: they must not be cached or treated as authoritative.
+    degraded: bool = False
 
 
 def reciprocal_rank_fusion(
@@ -122,8 +125,10 @@ class Retriever:
             raise vector_res
         vector = [] if isinstance(vector_res, BaseException) else vector_res
         keyword = [] if isinstance(keyword_res, BaseException) else keyword_res
+        degraded = False
         for leg, res in (("vector", vector_res), ("keyword", keyword_res)):
             if isinstance(res, BaseException):
+                degraded = True
                 self._tel.metrics.retrieval_degraded.labels(leg).inc()
                 log.warning("retrieval_leg_failed", leg=leg, error=repr(res))
 
@@ -134,6 +139,7 @@ class Retriever:
                 "rerank", self._reranker.rerank(query, candidates, cfg.k_final)
             )
         except Exception as exc:
+            degraded = True
             self._tel.metrics.retrieval_degraded.labels("rerank").inc()
             log.warning("rerank_failed_using_fused_order", error=repr(exc))
             final = candidates[: cfg.k_final]
@@ -141,7 +147,7 @@ class Retriever:
             final = [
                 h for h in final if h.rerank_score is None or h.rerank_score >= cfg.min_rerank_score
             ]
-        return RetrievalResult(final, len(vector), len(keyword), len(candidates))
+        return RetrievalResult(final, len(vector), len(keyword), len(candidates), degraded)
 
     async def _vector(self, query: str) -> list[SearchHit]:
         (embedding,) = await self._embedder.embed([query], "query")

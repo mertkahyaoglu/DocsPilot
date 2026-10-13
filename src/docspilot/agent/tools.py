@@ -7,7 +7,7 @@ import asyncio
 import json
 import time
 from abc import ABC, abstractmethod
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from typing import Any, ClassVar
 
 import anthropic
@@ -28,6 +28,9 @@ class ToolContext:
     user_id: str
     tickets: TicketStore
     idempotency_key: str | None = None
+    #: Per-request scratch set tools use to tell the caller about the turn
+    #: ("degraded_retrieval"). Shared by reference across `with_key` copies.
+    flags: set[str] = field(default_factory=set)
 
     def with_key(self, key: str) -> ToolContext:
         return replace(self, idempotency_key=key)
@@ -260,6 +263,8 @@ class SearchDocsTool(Tool):
 
     async def run(self, args: SearchDocsInput, ctx: ToolContext) -> dict[str, Any]:
         result = await self._retriever.search(args.query)
+        if result.degraded:
+            ctx.flags.add("degraded_retrieval")
         results: list[dict[str, Any]] = []
         for hit in result.hits:  # best first: when the budget runs out the tail is dropped
             c = hit.chunk

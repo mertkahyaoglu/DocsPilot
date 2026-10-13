@@ -1,9 +1,10 @@
 from __future__ import annotations
 
+import secrets
 from collections.abc import AsyncIterator
 from contextlib import AsyncExitStack, asynccontextmanager
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from opentelemetry import trace
@@ -18,7 +19,7 @@ from docspilot.api.debug import router as debug_router
 from docspilot.api.feedback import router as feedback_router
 from docspilot.api.middleware import BodySizeLimitMiddleware, RequestContextMiddleware
 from docspilot.api.triage import router as triage_router
-from docspilot.cache import ResponseCache, corpus_version
+from docspilot.cache import CorpusVersionProvider, ResponseCache
 from docspilot.config import Settings, get_settings
 from docspilot.llm.client import AnthropicLLM, build_anthropic_client
 from docspilot.llm.fake import FakeLLM, Script
@@ -47,6 +48,8 @@ def create_app(
             registry = PromptRegistry(settings.prompts_dir)
             answer_prompt = registry.get("answer", settings.answer_prompt_version)  # fail fast
             registry.get("triage")
+            if settings.routing:
+                registry.get("smalltalk")  # fail at startup, not on the first request
             app.state.prompts_registry = registry
 
             provider = setup_tracing(settings, span_exporter)
@@ -87,7 +90,7 @@ def create_app(
             app.state.response_cache = ResponseCache(
                 ttl_s=settings.response_cache_ttl_s, max_items=settings.response_cache_max_items
             )
-            app.state.corpus_version = corpus_version(await rag.store.document_state())
+            app.state.corpus_versions = CorpusVersionProvider(rag.store.document_state)
             log.info(
                 "startup",
                 env=settings.env,
@@ -122,10 +125,15 @@ def create_app(
         """Liveness: the process is up. Must not touch dependencies."""
         return {"status": "ok"}
 
-    if settings.metrics_enabled:
+    token = settings.metrics_token.get_secret_value() if settings.metrics_token else None
+    if settings.metrics_enabled and (not prod or token):
 
         @app.get("/metrics", include_in_schema=False)
-        async def metrics() -> Response:
+        async def metrics(request: Request) -> Response:
+            if token is not None:
+                supplied = request.headers.get("authorization", "")
+                if not secrets.compare_digest(supplied, f"Bearer {token}"):
+                    return Response(status_code=401, headers={"WWW-Authenticate": "Bearer"})
             return Response(
                 generate_latest(app.state.telemetry.metrics.registry),
                 media_type=CONTENT_TYPE_LATEST,

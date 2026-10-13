@@ -16,7 +16,7 @@ import hashlib
 import re
 import time
 from collections import OrderedDict
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 
 _WS = re.compile(r"\s+")
@@ -84,3 +84,29 @@ def corpus_version(state: dict[str, tuple[str, str]]) -> str:
         content_hash, model = state[path]
         h.update(f"{path}\x1f{content_hash}\x1f{model}\x1e".encode())
     return h.hexdigest()[:16]
+
+
+class CorpusVersionProvider:
+    """Cheap, periodically refreshed corpus fingerprint. A re-ingest by another process
+    changes the version within `refresh_s`, so cached answers cannot outlive it for
+    long even though the web process never restarted."""
+
+    def __init__(
+        self,
+        fetch: Callable[[], Awaitable[dict[str, tuple[str, str]]]],
+        *,
+        refresh_s: float = 30.0,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        self._fetch = fetch
+        self._refresh_s = refresh_s
+        self._clock = clock
+        self._value: str | None = None
+        self._at = 0.0
+
+    async def get(self) -> str:
+        now = self._clock()
+        if self._value is None or now - self._at >= self._refresh_s:
+            self._value = corpus_version(await self._fetch())
+            self._at = now
+        return self._value

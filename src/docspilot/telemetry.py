@@ -21,6 +21,7 @@ from opentelemetry.sdk.resources import Resource
 from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import BatchSpanProcessor, SimpleSpanProcessor, SpanExporter
 from opentelemetry.trace import Span, Status, StatusCode
+from opentelemetry.util.re import parse_env_headers
 from prometheus_client import CollectorRegistry, Counter, Gauge, Histogram
 
 from docspilot.config import Settings
@@ -86,6 +87,18 @@ class Metrics:
             "docspilot_cache_requests_total", "Response cache lookups", ["result"], registry=r
         )
         self.route = Counter("docspilot_route_total", "Routing decisions", ["route"], registry=r)
+        self.llm_fallback = Counter(
+            "docspilot_llm_fallback_total",
+            "Calls rescued by the refusal-fallback model",
+            ["requested", "served"],
+            registry=r,
+        )
+        self.llm_unpriced = Counter(
+            "docspilot_llm_unpriced_total",
+            "Calls whose model has no price entry (spend is under-reported)",
+            ["model"],
+            registry=r,
+        )
         self.requests = Counter(
             "docspilot_chat_requests_total", "Chat turns", ["outcome"], registry=r
         )
@@ -105,8 +118,13 @@ class Telemetry:
 
     @contextlib.contextmanager
     def span(self, name: str, **attributes: Any) -> Iterator[Span]:
+        """A *current* span for code that does not yield while it is open (tools,
+        retrieval). Do not hold this across an `yield` of an async generator."""
         with self.tracer.start_as_current_span(
-            name, attributes={k: v for k, v in attributes.items() if v is not None}
+            name,
+            attributes={k: v for k, v in attributes.items() if v is not None},
+            record_exception=False,  # recorded once, below
+            set_status_on_exception=False,
         ) as span:
             try:
                 yield span
@@ -114,6 +132,22 @@ class Telemetry:
                 span.record_exception(exc)
                 span.set_status(Status(StatusCode.ERROR, type(exc).__name__))
                 raise
+
+    def start(self, name: str, **attributes: Any) -> Span:
+        """A span that is *not* made current: safe to keep open across generator yields
+        (and to end from whichever context finalizes the generator)."""
+        return self.tracer.start_span(
+            name, attributes={k: v for k, v in attributes.items() if v is not None}
+        )
+
+    @contextlib.contextmanager
+    def activate(self, span: Span) -> Iterator[None]:
+        """Make `span` current for a short synchronous-looking section, e.g. around one
+        `await anext(...)` so child spans created inside get the right parent."""
+        with trace.use_span(
+            span, end_on_exit=False, record_exception=False, set_status_on_exception=False
+        ):
+            yield
 
     def content(self, span: Span, key: str, value: str) -> None:
         """Opt-in, redacted, truncated. Never called with credentials by design."""
@@ -133,6 +167,8 @@ def record_llm_usage(
     cost = cost_usd(model, usage)
     if cost is not None:
         metrics.llm_cost.labels(m, p).inc(cost)
+    else:
+        metrics.llm_unpriced.labels(m).inc()  # SpendRateHigh would silently under-report
     return cost
 
 
@@ -149,9 +185,8 @@ def setup_tracing(
         )
     )
     if exporter is None:
-        headers = dict(
-            pair.split("=", 1) for pair in (settings.otlp_headers or "").split(",") if "=" in pair
-        )
+        # URL-decoding and whitespace handling per the OTLP env-var spec.
+        headers = parse_env_headers(settings.otlp_headers or "", liberal=True)
         endpoint = (settings.otlp_endpoint or "").rstrip("/")
         if not endpoint.endswith("/v1/traces"):
             endpoint += "/v1/traces"

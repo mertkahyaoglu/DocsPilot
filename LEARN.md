@@ -381,6 +381,30 @@ what your timeouts care about. Track both.
    small talk).
 6. **Context budget**: retrieval volume (Phase 3) is usually the biggest input lever.
 
+### Hard-won details (all found in review)
+- **Never hold an OTel span as "current" across an `async` generator `yield`.** On client
+  disconnect the generator is finalised from another context: you get detach errors,
+  a stuck in-flight gauge and spans that never end. Spans that live across yields are
+  created with `start_span` and ended in `finally`; they are *activated* only around
+  each step of the inner stream so child spans still parent correctly.
+- **Disconnects are not errors.** `GeneratorExit`/`CancelledError` become
+  `outcome="cancelled"`, otherwise a mobile network blip pages you through the error-rate
+  alert.
+- **Do not cache what was produced under failure.** The response cache refuses turns whose
+  search errored, ran degraded (a retrieval leg or reranker was down), never searched,
+  used any non-docs tool, came from the fallback model, or were routed to the small
+  model. A cached "sorry, I couldn't search right now" would otherwise outlive the outage
+  for the whole TTL, for every user.
+- **The corpus version is refreshed**, not computed once: a re-ingest by another process
+  must invalidate cached answers within seconds, not at the next deploy.
+- **A metric you cannot trust is worse than none**: one `model` label (the model that
+  actually served), explicit counters for fallbacks and for *unpriced* models, so
+  `SpendRateHigh` cannot silently under-report.
+- OTLP headers are URL-decoded/trimmed per spec (a Basic-auth header with `%20` otherwise
+  401s and traces vanish without an error). `/metrics` is only served in prod when
+  `DOCSPILOT_METRICS_TOKEN` is set. Redaction covers common token shapes, IBAN, SSN and
+  URL credentials, and remains a net, not a guarantee.
+
 ### What breaks in production
 | Symptom | Cause | Where to look |
 |---|---|---|
