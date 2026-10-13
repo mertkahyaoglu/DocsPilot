@@ -23,6 +23,10 @@ class Ticket(BaseModel):
     created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
 
 
+class IdempotencyConflictError(Exception):
+    """Same idempotency key reused with different arguments."""
+
+
 class TicketStore(Protocol):
     async def create(
         self,
@@ -44,7 +48,7 @@ class TicketStore(Protocol):
 class InMemoryTicketStore:
     def __init__(self) -> None:
         self._by_id: dict[str, Ticket] = {}
-        self._by_key: dict[str, str] = {}
+        self._by_key: dict[str, tuple[str, tuple[str, str, str, str]]] = {}
 
     async def create(
         self,
@@ -55,9 +59,13 @@ class InMemoryTicketStore:
         severity: Severity,
         idempotency_key: str,
     ) -> Ticket:
+        fingerprint = (user_id, title, description, severity)
         existing = self._by_key.get(idempotency_key)
         if existing is not None:
-            return self._by_id[existing]
+            ticket_id, original = existing
+            if original != fingerprint:
+                raise IdempotencyConflictError(idempotency_key)
+            return self._by_id[ticket_id]
         ticket = Ticket(
             id=f"TCK-{secrets.token_hex(4)}",
             user_id=user_id,
@@ -66,7 +74,7 @@ class InMemoryTicketStore:
             severity=severity,
         )
         self._by_id[ticket.id] = ticket
-        self._by_key[idempotency_key] = ticket.id
+        self._by_key[idempotency_key] = (ticket.id, fingerprint)
         return ticket
 
     async def get(self, ticket_id: str, *, user_id: str) -> Ticket | None:

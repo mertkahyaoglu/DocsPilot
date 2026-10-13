@@ -7,12 +7,16 @@ the two cases where the guarantee does not apply: refusals and truncation.
 
 from __future__ import annotations
 
-from typing import Literal
+from typing import Annotated, Literal
 
 import anthropic
-from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from pydantic import BaseModel, BeforeValidator, ConfigDict, ValidationError
 
 from docspilot.llm.types import LLM, LLMRequest, Usage, complete
+
+
+def _clip(value: object) -> object:
+    return value[:300] if isinstance(value, str) else value
 
 
 class Triage(BaseModel):
@@ -21,7 +25,8 @@ class Triage(BaseModel):
     intent: Literal["question", "ticket_request", "complaint", "smalltalk", "other"]
     urgency: Literal["low", "normal", "high"]
     product_area: Literal["billing", "invoices", "payments", "api", "security", "account", "other"]
-    summary: str = Field(max_length=300)
+    # Decoding cannot enforce maxLength (the schema transform drops it), so truncate.
+    summary: Annotated[str, BeforeValidator(_clip)]
 
 
 class TriageError(Exception):

@@ -98,7 +98,9 @@ def _to_result(message: Any, request_id: str | None = None) -> LLMResult:
         getattr(it, "type", None) == "fallback_message" for it in iterations
     )
     tool_calls = [
-        ToolCall(id=b.id, name=b.name, input=dict(b.input)) for b in blocks if b.type == "tool_use"
+        ToolCall(id=b.id, name=b.name, input=dict(b.input))
+        for b in blocks[last_fallback + 1 :]
+        if b.type == "tool_use"
     ]
     usage = Usage(
         input_tokens=u.input_tokens or 0,

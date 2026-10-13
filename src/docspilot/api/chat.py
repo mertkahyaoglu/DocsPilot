@@ -19,7 +19,7 @@ from docspilot.agent.loop import (
     ToolEnd,
     ToolStart,
 )
-from docspilot.agent.pending import PendingStore
+from docspilot.agent.pending import PendingBusyError, PendingStore
 from docspilot.agent.tools import ToolContext
 from docspilot.api.deps import current_user_id
 from docspilot.api.schemas import ChatRequest
@@ -152,8 +152,11 @@ async def confirm(
     agent: Agent = request.app.state.agent
     store: PendingStore = request.app.state.pending
     tickets: TicketStore = request.app.state.tickets
-    # Single use: popping first means a double-click cannot run the action twice.
-    pending = await store.pop(body.pending_id, user_id=user_id)
+    # Exclusive claim: a double-click or concurrent retry cannot run the action twice.
+    try:
+        pending = await store.claim(body.pending_id, user_id=user_id)
+    except PendingBusyError:
+        raise HTTPException(409, "this confirmation is already being processed") from None
     if pending is None:
         raise HTTPException(404, "pending action not found or expired")
     log.info("confirmation", approve=body.approve, tools=[c.name for c in pending.calls])

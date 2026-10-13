@@ -86,3 +86,26 @@ async def test_triage_bad_output_is_502(use_llm, client: httpx.AsyncClient) -> N
     use_llm(FakeLLM([Script(text="", stop_reason="refusal")]))
     res = await client.post("/v1/triage", json={"message": "hi"})
     assert res.status_code == 502
+
+
+async def test_triage_truncates_overlong_summary(use_llm, client: httpx.AsyncClient) -> None:  # type: ignore[no-untyped-def]
+    payload = {
+        "intent": "question",
+        "urgency": "low",
+        "product_area": "billing",
+        "summary": "x" * 500,
+    }
+    use_llm(FakeLLM([Script(text=json.dumps(payload))]))
+    res = await client.post("/v1/triage", json={"message": "hi"})
+    assert res.status_code == 200
+    assert len(res.json()["triage"]["summary"]) == 300
+
+
+async def test_concurrent_confirm_gets_409(app, use_llm, client: httpx.AsyncClient) -> None:  # type: ignore[no-untyped-def]
+    use_llm(FakeLLM([Script(tool_calls=[CREATE]), Script(text="ok")]))
+    res = await client.post("/v1/chat", json=BODY)
+    pid = parse_sse(res.text)[0][1]["pending_id"]
+    claimed = await app.state.pending.claim(pid, user_id="anonymous")  # another request holds it
+    assert claimed is not None
+    res2 = await client.post("/v1/chat/confirm", json={"pending_id": pid, "approve": True})
+    assert res2.status_code == 409

@@ -104,6 +104,13 @@ class ToolRegistry:
             return ToolOutcome(str(exc), True)
         except TimeoutError:
             log.warning("tool_timeout", tool=tool.name, timeout_s=timeout_s)
+            if tool.requires_confirmation:
+                # Outcome unknown: a blind retry could duplicate the side effect.
+                return ToolOutcome(
+                    f"{tool.name} timed out and its outcome is unknown. Do not retry; "
+                    "tell the user to check before trying again.",
+                    True,
+                )
             return ToolOutcome(f"{tool.name} timed out. You may retry once.", True)
         except Exception:
             # Never leak internals to the model (it may repeat them to the user).

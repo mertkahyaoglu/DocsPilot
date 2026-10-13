@@ -16,7 +16,7 @@ from docspilot.agent.loop import (
     ToolEnd,
     ToolStart,
 )
-from docspilot.agent.pending import InMemoryPendingStore
+from docspilot.agent.pending import InMemoryPendingStore, PendingAction, PendingBusyError
 from docspilot.agent.tools import (
     Tool,
     ToolContext,
@@ -25,9 +25,10 @@ from docspilot.agent.tools import (
     ToolRegistry,
     default_tools,
 )
+from docspilot.llm.errors import LLMError
 from docspilot.llm.fake import FakeLLM, Script
 from docspilot.llm.types import LLMRequest, ToolCall
-from docspilot.tickets import InMemoryTicketStore
+from docspilot.tickets import IdempotencyConflictError, InMemoryTicketStore
 
 USER = "u1"
 
@@ -214,23 +215,76 @@ async def test_write_tool_pauses_then_runs_once_on_approval() -> None:
     assert len(llm.requests) == 1  # model is NOT called again until a human decides
     assert tickets._by_id == {}  # and nothing was created
 
-    taken = await pending.pop(needs.pending_id, user_id=USER)
+    taken = await pending.claim(needs.pending_id, user_id=USER)
     assert taken is not None
-    assert await pending.pop(needs.pending_id, user_id=USER) is None  # single use
+    with pytest.raises(PendingBusyError):  # concurrent confirm while in flight
+        await pending.claim(needs.pending_id, user_id=USER)
 
     resumed = await collect(agent.resume(taken, approve=True, ctx=ctx(tickets)))
     assert isinstance(resumed[-1], AgentFinished) and resumed[-1].text.startswith("Done")
     assert len(tickets._by_id) == 1
     tool_result = llm.requests[1].messages[-1]["content"][0]
     assert tool_result["tool_use_id"] == "w1" and "TCK-" in tool_result["content"]
+    # finished turn => entry gone: replaying the confirmation finds nothing
+    assert await pending.claim(needs.pending_id, user_id=USER) is None
 
-    # replaying the same confirmed action cannot create a second ticket
-    again = await collect(
-        Agent(
-            llm, ToolRegistry(default_tools()), pending, AgentConfig(model="m", system="s")
-        ).resume(taken, approve=True, ctx=ctx(tickets))
+
+async def test_approval_on_last_step_still_gets_an_answer() -> None:
+    agent, _, tickets, pending = build(
+        [Script(tool_calls=[call("w1", "create_ticket", **TICKET_ARGS)]), Script(text="Opened.")],
+        max_steps=1,
     )
-    assert again and len(tickets._by_id) == 1
+    events = await collect(agent.run(HISTORY, ctx(tickets)))
+    needs = events[-1]
+    assert isinstance(needs, NeedsConfirmation)
+    taken = await pending.claim(needs.pending_id, user_id=USER)
+    assert taken is not None
+    resumed = await collect(agent.resume(taken, approve=True, ctx=ctx(tickets)))
+    last = resumed[-1]
+    assert isinstance(last, AgentFinished)
+    assert (last.stop_reason, last.text) == ("end_turn", "Opened.")
+    assert len(tickets._by_id) == 1
+
+
+async def test_failed_followup_keeps_outcome_and_retry_does_not_duplicate() -> None:
+    boom = LLMError("overloaded", kind="overloaded", status_code=529)
+    agent, llm, tickets, pending = build(
+        [
+            Script(tool_calls=[call("w1", "create_ticket", **TICKET_ARGS)]),
+            Script(error=boom),  # follow-up model call fails after the ticket was created
+            Script(text="Your ticket is open."),
+        ]
+    )
+    events = await collect(agent.run(HISTORY, ctx(tickets)))
+    needs = events[-1]
+    assert isinstance(needs, NeedsConfirmation)
+
+    taken = await pending.claim(needs.pending_id, user_id=USER)
+    assert taken is not None
+    with pytest.raises(LLMError):
+        await collect(agent.resume(taken, approve=True, ctx=ctx(tickets)))
+    assert len(tickets._by_id) == 1  # side effect happened exactly once
+
+    retry = await pending.claim(needs.pending_id, user_id=USER)  # entry survived, claim released
+    assert retry is not None and retry.awaiting == []
+    final = await collect(agent.resume(retry, approve=True, ctx=ctx(tickets)))
+    assert isinstance(final[-1], AgentFinished) and final[-1].text == "Your ticket is open."
+    assert len(tickets._by_id) == 1  # replayed, not re-executed
+    assert not any(isinstance(e, ToolStart) for e in final)
+    assert "TCK-" in llm.requests[2].messages[-1]["content"][0]["content"]
+
+
+async def test_usage_accumulates_across_pause() -> None:
+    agent, _, tickets, pending = build(
+        [Script(tool_calls=[call("w", "create_ticket", **TICKET_ARGS)]), Script(text="ok")]
+    )
+    needs = (await collect(agent.run(HISTORY, ctx(tickets))))[-1]
+    assert isinstance(needs, NeedsConfirmation)
+    taken = await pending.claim(needs.pending_id, user_id=USER)
+    assert taken is not None
+    done = (await collect(agent.resume(taken, approve=True, ctx=ctx(tickets))))[-1]
+    assert isinstance(done, AgentFinished)
+    assert done.usage.input_tokens == 20 and done.steps == 2  # 10 per scripted turn
 
 
 async def test_write_tool_declined_never_executes() -> None:
@@ -243,7 +297,7 @@ async def test_write_tool_declined_never_executes() -> None:
     events = await collect(agent.run(HISTORY, ctx(tickets)))
     needs = events[-1]
     assert isinstance(needs, NeedsConfirmation)
-    taken = await pending.pop(needs.pending_id, user_id=USER)
+    taken = await pending.claim(needs.pending_id, user_id=USER)
     assert taken is not None
     await collect(agent.resume(taken, approve=False, ctx=ctx(tickets)))
     assert tickets._by_id == {}
@@ -266,34 +320,51 @@ async def test_mixed_turn_runs_reads_before_pausing() -> None:
     assert any(isinstance(e, ToolEnd) and e.id == "r" for e in events)
     needs = events[-1]
     assert isinstance(needs, NeedsConfirmation)
-    taken = await pending.pop(needs.pending_id, user_id=USER)
+    taken = await pending.claim(needs.pending_id, user_id=USER)
     assert taken is not None and "r" in taken.completed and taken.awaiting == ["w"]
     await collect(agent.resume(taken, approve=True, ctx=ctx(tickets)))
     results = llm.requests[1].messages[-1]["content"]
     assert [r["tool_use_id"] for r in results] == ["r", "w"]  # original order
 
 
+def _item(id_: str, user: str = USER, expires: float | None = None) -> PendingAction:
+    return PendingAction(
+        id_, user, [], [], {}, [], 1, expires if expires is not None else time.time() + 60
+    )
+
+
 async def test_pending_store_owner_expiry_and_capacity() -> None:
-    store = InMemoryPendingStore(ttl_s=60, max_items=2)
+    store = InMemoryPendingStore(ttl_s=60, max_items=3, max_per_user=2)
 
-    def item(id_: str, user: str = USER, expires: float | None = None):  # type: ignore[no-untyped-def]
-        from docspilot.agent.pending import PendingAction
+    await store.put(_item("a"))
+    assert await store.claim("a", user_id="someone-else") is None
+    assert await store.claim("a", user_id=USER) is not None
 
-        return PendingAction(
-            id_, user, [], [], {}, [], 1, expires if expires is not None else time.time() + 60
-        )
+    await store.put(_item("old", expires=time.time() - 1))
+    assert await store.claim("old", user_id=USER) is None
 
-    await store.put(item("a"))
-    assert await store.pop("a", user_id="someone-else") is None
-    assert await store.pop("a", user_id=USER) is not None  # not consumed by the failed attempt
-
-    await store.put(item("old", expires=time.time() - 1))
-    assert await store.pop("old", user_id=USER) is None
-
+    # per-user cap evicts that user's oldest, never another user's entry
+    await store.put(_item("other", user="u2"))
     for n in ("1", "2", "3"):
-        await store.put(item(n))
-    assert await store.pop("1", user_id=USER) is None  # evicted
-    assert await store.pop("3", user_id=USER) is not None
+        await store.put(_item(n))
+    assert await store.claim("1", user_id=USER) is None
+    assert await store.claim("3", user_id=USER) is not None
+    assert await store.claim("other", user_id="u2") is not None
+
+
+async def test_idempotency_key_reuse_with_different_args_is_rejected() -> None:
+    tickets = InMemoryTicketStore()
+    first = await tickets.create(
+        user_id=USER, title="t", description="d", severity="low", idempotency_key="k"
+    )
+    same = await tickets.create(
+        user_id=USER, title="t", description="d", severity="low", idempotency_key="k"
+    )
+    assert same.id == first.id
+    with pytest.raises(IdempotencyConflictError):
+        await tickets.create(
+            user_id=USER, title="other", description="d", severity="low", idempotency_key="k"
+        )
 
 
 def test_tool_specs_are_strict_and_deterministic() -> None:

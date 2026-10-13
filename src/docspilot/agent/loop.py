@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import time
 from collections.abc import AsyncGenerator
+from contextlib import aclosing
 from dataclasses import dataclass
 from typing import Any
 
@@ -124,33 +125,60 @@ class Agent:
     async def resume(
         self, pending: PendingAction, *, approve: bool, ctx: ToolContext
     ) -> AsyncGenerator[AgentEvent, None]:
-        """Continue after a human decision on the paused write call(s)."""
-        outcomes = dict(pending.completed)
-        waiting = [c for c in pending.calls if c.id in pending.awaiting]
-        for call in waiting:
-            if not approve:
-                outcomes[call.id] = ToolOutcome(DECLINED)
-                continue
-            parsed = self._registry.parse(call.name, call.input)
-            if isinstance(parsed, ToolOutcome):
-                outcomes[call.id] = parsed
-                continue
-            tool, args = parsed
-            yield ToolStart(call.id, call.name, call.input)
-            started = time.perf_counter()
-            keyed = ctx.with_key(f"{pending.id}:{call.id}")  # retry-safe side effect
-            outcomes[call.id] = await self._registry.execute(
-                tool, args, keyed, timeout_s=self._config.tool_timeout_s
-            )
-            yield ToolEnd(
-                call.id,
-                call.name,
-                outcomes[call.id].is_error,
-                round((time.perf_counter() - started) * 1000, 1),
-            )
-        messages = [*pending.messages, self._results_message(pending.calls, outcomes)]
-        async for event in self._loop(messages, ctx, steps_left=pending.steps_left):
-            yield event
+        """Continue after a human decision on the paused write call(s).
+
+        `pending` must be claimed by the caller. Safe to call again on the same entry
+        after a failure: already-resolved calls are replayed, never re-executed."""
+        if pending.awaiting:
+            waiting = [c for c in pending.calls if c.id in pending.awaiting]
+            for call in waiting:
+                if not approve:
+                    pending.completed[call.id] = ToolOutcome(DECLINED)
+                    continue
+                parsed = self._registry.parse(call.name, call.input)
+                if isinstance(parsed, ToolOutcome):
+                    pending.completed[call.id] = parsed
+                    continue
+                tool, args = parsed
+                yield ToolStart(call.id, call.name, call.input)
+                started = time.perf_counter()
+                # Same key on every retry of this confirmation => at-most-once side effect
+                # even if we crashed after executing but before recording the outcome.
+                keyed = ctx.with_key(f"{pending.id}:{call.id}")
+                outcome = await self._registry.execute(
+                    tool, args, keyed, timeout_s=self._config.tool_timeout_s
+                )
+                pending.completed[call.id] = outcome
+                yield ToolEnd(
+                    call.id,
+                    call.name,
+                    outcome.is_error,
+                    round((time.perf_counter() - started) * 1000, 1),
+                )
+            pending.awaiting = []  # resolved: a retry replays instead of re-executing
+
+        messages = [*pending.messages, self._results_message(pending.calls, pending.completed)]
+        finished = False
+        try:
+            # The pause already spent its step; always leave one for the model to answer.
+            async with aclosing(
+                self._loop(
+                    messages,
+                    ctx,
+                    steps_left=max(pending.steps_left, 1),
+                    usage=pending.usage,
+                    steps=pending.steps,
+                )
+            ) as stream:
+                async for event in stream:
+                    if isinstance(event, AgentFinished | NeedsConfirmation):
+                        finished = True
+                    yield event
+        finally:
+            if finished:
+                await self._pending.delete(pending.id)
+            else:  # failed or disconnected: keep the resolved entry so the client can retry
+                await self._pending.release(pending)
 
     # -- internals ------------------------------------------------------------
 
@@ -164,10 +192,15 @@ class Agent:
         }
 
     async def _loop(
-        self, messages: list[dict[str, Any]], ctx: ToolContext, *, steps_left: int
+        self,
+        messages: list[dict[str, Any]],
+        ctx: ToolContext,
+        *,
+        steps_left: int,
+        usage: Usage | None = None,
+        steps: int = 0,
     ) -> AsyncGenerator[AgentEvent, None]:
-        usage = Usage()
-        steps = 0
+        usage = usage or Usage()
         cfg = self._config
         while steps_left > 0:
             steps += 1
@@ -181,11 +214,12 @@ class Agent:
                 effort=cfg.effort,
             )
             result: LLMResult | None = None
-            async for event in self._llm.stream(request):
-                if isinstance(event, LLMResult):
-                    result = event
-                else:
-                    yield event
+            async with aclosing(self._llm.stream(request)) as llm_stream:
+                async for event in llm_stream:
+                    if isinstance(event, LLMResult):
+                        result = event
+                    else:
+                        yield event
             assert result is not None
             usage += result.usage
             log.info(
@@ -236,7 +270,9 @@ class Agent:
                 yield ToolEnd(call.id, call.name, outcome.is_error, ms)
 
             if awaiting:
-                yield await self._pause(messages, result, outcomes, awaiting, ctx, steps_left)
+                yield await self._pause(
+                    messages, result, outcomes, awaiting, ctx, steps_left, usage, steps
+                )
                 return
             messages.append(self._results_message(result.tool_calls, outcomes))
 
@@ -265,6 +301,8 @@ class Agent:
         awaiting: list[str],
         ctx: ToolContext,
         steps_left: int,
+        usage: Usage,
+        steps: int,
     ) -> NeedsConfirmation:
         pending = PendingAction(
             id=self._pending.new_id(),
@@ -275,6 +313,8 @@ class Agent:
             awaiting=awaiting,
             steps_left=steps_left,
             expires_at=time.time() + self._ttl,
+            usage=usage,
+            steps=steps,
         )
         await self._pending.put(pending)
         items = []
