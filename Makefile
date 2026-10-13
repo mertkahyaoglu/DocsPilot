@@ -1,4 +1,4 @@
-.PHONY: dev dev-offline test test-integration lint fmt typecheck check db ingest eval-retrieval eval-answers eval-calibrate
+.PHONY: up down smoke load docker-build dev dev-offline test test-integration lint fmt typecheck check db ingest eval-retrieval eval-answers eval-calibrate
 
 dev:
 	uv run uvicorn --factory docspilot.api.app:create_app --reload --port 8000
@@ -44,3 +44,21 @@ eval-answers:
 
 eval-calibrate:
 	uv run python -m docspilot.evals calibrate
+
+# ---- container stack -----------------------------------------------------------------
+docker-build:
+	docker build --build-arg GIT_SHA=$$(git rev-parse --short HEAD) -t docspilot:local .
+
+# whole stack (db + api). `DOCSPILOT_LLM_BACKEND=fake make up` needs no API key.
+up:
+	GIT_SHA=$$(git rev-parse --short HEAD) docker compose up -d --build --wait db api
+
+down:
+	docker compose down
+
+smoke:
+	python3 scripts/smoke.py http://127.0.0.1:8000
+
+# against a locally started server with DOCSPILOT_LLM_BACKEND=fake and limits disabled
+load:
+	uv run python scripts/loadtest.py http://127.0.0.1:8000 -n 200 -c 20

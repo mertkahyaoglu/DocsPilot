@@ -87,6 +87,13 @@ class Settings(BaseSettings):
     effort_answer: Effort = "medium"
     max_tokens: int = Field(default=16000, ge=256)
 
+    #: Secondary model for the answer path when the primary fails (None disables failover).
+    model_fallback: str | None = "claude-sonnet-5-5"
+    breaker_threshold: int = Field(default=5, ge=1)
+    breaker_recovery_s: float = Field(default=30.0, gt=0)
+    #: Serve retrieval-only answers when no model is available.
+    degraded_mode: bool = True
+
     llm_timeout_s: float = Field(default=60.0, gt=0)
     llm_connect_timeout_s: float = Field(default=5.0, gt=0)
     llm_max_retries: int = Field(default=2, ge=0, le=6)

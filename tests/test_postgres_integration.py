@@ -160,3 +160,84 @@ async def test_spend_store_add_is_atomic_and_returns_the_new_total(dsn: str) -> 
         assert await store.spent_today("racer") == pytest.approx(0.8)
     finally:
         await pool.close()
+
+
+async def test_pending_store_shared_between_replicas_and_survives_restart(dsn: str) -> None:
+    import time
+
+    from anthropic.types import TextBlock, ToolUseBlock
+
+    from docspilot.agent.loop import Agent, AgentConfig, AgentFinished, NeedsConfirmation
+    from docspilot.agent.pending import PendingBusyError
+    from docspilot.agent.pending_pg import PostgresPendingStore, decode, encode
+    from docspilot.agent.tools import ToolContext, ToolRegistry, default_tools
+    from docspilot.llm.fake import FakeLLM, Script
+    from docspilot.llm.types import ToolCall
+    from docspilot.tickets import InMemoryTicketStore
+
+    pool_a, pool_b = await create_pool(dsn), await create_pool(dsn)
+    try:
+        replica_a, replica_b = PostgresPendingStore(pool_a), PostgresPendingStore(pool_b)
+        args = {
+            "title": "Stuck payout",
+            "description": "In transit for 6 days.",
+            "severity": "high",
+        }
+
+        # replica A runs the turn up to the human gate; blocks are real SDK objects
+        agent_a = Agent(
+            FakeLLM([Script(tool_calls=[ToolCall("w", "create_ticket", args)])]),
+            ToolRegistry(default_tools()),
+            replica_a,
+            AgentConfig(model="m", system="s"),
+        )
+        tickets = InMemoryTicketStore()
+        ctx = ToolContext("alice", tickets)
+        events = [e async for e in agent_a.run([{"role": "user", "content": "open ticket"}], ctx)]
+        needs = events[-1]
+        assert isinstance(needs, NeedsConfirmation)
+
+        # the assistant turn survives JSON with real SDK content blocks inside
+        stored = await replica_b.claim(needs.pending_id, user_id="alice")
+        assert stored is not None
+        assert stored.calls[0].name == "create_ticket" and stored.awaiting == ["w"]
+        stored.messages[-1]["content"] = [
+            TextBlock(type="text", text="ok", citations=None),
+            ToolUseBlock(type="tool_use", id="w", name="create_ticket", input=args),
+        ]
+        again = decode(encode(stored))
+        assert again.messages[-1]["content"][1] == {
+            "type": "tool_use",
+            "id": "w",
+            "name": "create_ticket",
+            "input": args,
+        }
+
+        # claim exclusivity across replicas, owner scoping, and release persistence
+        with pytest.raises(PendingBusyError):
+            await replica_a.claim(needs.pending_id, user_id="alice")
+        assert await replica_a.claim("nope" * 8, user_id="alice") is None
+        await replica_b.release(stored)
+        assert await replica_a.claim(needs.pending_id, user_id="mallory") is None
+
+        # replica B (a different process) completes the approved action
+        agent_b = Agent(
+            FakeLLM([Script(text="Your ticket is open.")]),
+            ToolRegistry(default_tools()),
+            replica_b,
+            AgentConfig(model="m", system="s"),
+        )
+        claimed = await replica_b.claim(needs.pending_id, user_id="alice")
+        assert claimed is not None
+        out = [e async for e in agent_b.resume(claimed, approve=True, ctx=ctx)]
+        assert isinstance(out[-1], AgentFinished) and len(tickets._by_id) == 1
+        assert await replica_a.claim(needs.pending_id, user_id="alice") is None  # deleted
+
+        # expiry and per-user cap
+        stale = claimed
+        stale.id, stale.expires_at, stale.claimed_until = "stale-id-0123456789", time.time() - 1, 0
+        await replica_a.put(stale)
+        assert await replica_a.claim("stale-id-0123456789", user_id="alice") is None
+    finally:
+        await pool_a.close()
+        await pool_b.close()

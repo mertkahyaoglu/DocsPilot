@@ -29,8 +29,9 @@ from docspilot.api.schemas import ChatRequest
 from docspilot.budget import Budget, CostMeter, current_meter
 from docspilot.cache import CachedAnswer, CorpusVersionProvider, ResponseCache, cache_key
 from docspilot.config import Settings
+from docspilot.degraded import degraded_answer
 from docspilot.llm.errors import LLMError
-from docspilot.llm.types import LLM, StreamReset, TextDelta
+from docspilot.llm.types import LLM, StreamReset, TextDelta, Usage
 from docspilot.logging import get_logger
 from docspilot.pricing import cost_usd
 from docspilot.prompts import PromptRegistry
@@ -118,6 +119,7 @@ async def _to_sse(
     allowed_hosts: tuple[str, ...] | None = None,
     settle: Callable[[str], Awaitable[None]] | None = None,
     drop_pending: Callable[[str], Awaitable[None]] | None = None,
+    degrade: Callable[[], Awaitable[tuple[str, list[dict[str, str]]] | None]] | None = None,
 ) -> AsyncIterator[dict[str, str]]:
     """Translate agent events to SSE. Always ends the stream with done|error.
 
@@ -134,6 +136,7 @@ async def _to_sse(
     tools: set[str] = set()
     search_ok = 0
     search_failed = 0
+    sent_chars = 0
     guard = StreamingGuard(allowed_hosts) if allowed_hosts else None
     root = tel.start("chat.request", **{"docspilot.request_id": request_id})
     m.in_flight.inc()
@@ -153,6 +156,7 @@ async def _to_sse(
                 text += event.text
                 out = guard.feed(event.text) if guard else event.text
                 if out:
+                    sent_chars += len(out)
                     yield _sse("delta", {"text": out})
             elif isinstance(event, StreamReset):
                 yield _sse("reset", {})
@@ -175,6 +179,7 @@ async def _to_sse(
             elif isinstance(event, NeedsConfirmation):
                 tail = flush_tail()
                 if tail:
+                    sent_chars += len(tail)
                     yield _sse("delta", {"text": tail})
                 # What the user is asked to approve is model-authored too: same checks.
                 args_text = "\n".join(s for i in event.items for s in _strings(i.arguments))
@@ -232,6 +237,7 @@ async def _to_sse(
                 )
                 tail = flush_tail()
                 if tail:
+                    sent_chars += len(tail)
                     yield _sse("delta", {"text": tail})
                 if guard and guard.blocked:
                     outcome = "output_blocked"
@@ -309,9 +315,39 @@ async def _to_sse(
             detail=str(exc),
         )
         root.record_exception(exc)
-        yield _sse(
-            "error", {"code": exc.kind, "retryable": exc.retryable, "message": exc.public_message}
-        )
+        fallback = None
+        if degrade is not None and exc.retryable and sent_chars == 0:
+            # Generation is down but nothing has been shown yet: answer from retrieval.
+            try:
+                fallback = await degrade()
+            except Exception:
+                log.exception("degraded_mode_failed")
+        if fallback is not None and (
+            not allowed_hosts or check_output(fallback[0], allowed_hosts).ok
+        ):
+            text_out, cites = fallback
+            outcome = "degraded"
+            m.degraded.inc()
+            log.warning("degraded_answer", cause=exc.kind, sources=len(cites))
+            yield _sse("delta", {"text": text_out})
+            yield _sse("citations", {"sources": cites})
+            yield _sse(
+                "done",
+                {
+                    "stop_reason": "degraded",
+                    "usage": asdict(Usage()),
+                    "model": None,
+                    "steps": 0,
+                    "request_id": request_id,
+                    "cached": False,
+                    "degraded": True,
+                },
+            )
+        else:
+            yield _sse(
+                "error",
+                {"code": exc.kind, "retryable": exc.retryable, "message": exc.public_message},
+            )
     except (GeneratorExit, asyncio.CancelledError):
         outcome = "cancelled"  # client disconnected: not an error
         raise
@@ -389,6 +425,13 @@ async def chat(
         else:
             events = agent.run(history, ToolContext(user_id=user_id, tickets=tickets))
         hosts = settings.allowed_host_list if settings.output_guard else None
+        degrade = None
+        if settings.degraded_mode and first_turn:
+            retriever = request.app.state.rag.retriever
+
+            async def degrade() -> tuple[str, list[dict[str, str]]] | None:
+                return await degraded_answer(retriever, question, settings.injection_policy)
+
         return EventSourceResponse(
             _to_sse(
                 events,
@@ -399,6 +442,7 @@ async def chat(
                 allowed_hosts=hosts,
                 settle=settle,
                 drop_pending=request.app.state.pending.delete,
+                degrade=degrade,
             )
         )
     except BaseException:
