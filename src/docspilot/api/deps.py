@@ -23,7 +23,7 @@ def _bearer(request: Request) -> str | None:
 
 async def authenticated_user(request: Request) -> str:
     auth: Authenticator = request.app.state.authenticator
-    principal = auth.authenticate(_bearer(request))
+    principal = await auth.authenticate(_bearer(request))
     if principal is None:
         request.app.state.telemetry.metrics.rejections.labels("unauthenticated").inc()
         raise HTTPException(401, "authentication required", headers={"WWW-Authenticate": "Bearer"})

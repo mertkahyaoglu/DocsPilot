@@ -21,8 +21,8 @@ def request(url: str, *, data: dict | None = None, key: str | None = None, timeo
     if key:
         headers["authorization"] = f"Bearer {key}"
     body = json.dumps(data).encode() if data is not None else None
-    req = urllib.request.Request(url, data=body, headers=headers)  # noqa: S310
-    return urllib.request.urlopen(req, timeout=timeout)  # noqa: S310
+    req = urllib.request.Request(url, data=body, headers=headers)
+    return urllib.request.urlopen(req, timeout=timeout)
 
 
 def sse_events(raw: str) -> list[tuple[str, dict]]:

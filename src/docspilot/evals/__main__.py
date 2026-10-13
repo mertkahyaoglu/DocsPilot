@@ -114,6 +114,8 @@ async def cmd_answers(args: argparse.Namespace) -> int:
         settings = settings.model_copy(update={"model_judge": args.judge_model})
     if args.model:
         settings = settings.model_copy(update={"model_answer": args.model})
+    if args.architecture:
+        settings = settings.model_copy(update={"architecture": args.architecture})
     if (args.limit or args.category) and (args.check_baseline or args.write_baseline):
         print("baselines need the full dataset: drop --limit/--category", file=sys.stderr)
         return 2
@@ -138,14 +140,33 @@ async def cmd_answers(args: argparse.Namespace) -> int:
             async def judge_fn(inp: Any) -> Any:
                 return await judge(llm, inp, system=judge_prompt.text, model=settings.model_judge)
 
-            graded = await run_answers_eval(
-                lambda: build_agent(
+            def make_agent() -> Any:
+                pending = InMemoryPendingStore()
+                if settings.architecture == "multi":
+                    from docspilot.agent.factory import build_orchestrator
+                    from docspilot.intents import LLMIntentClassifier
+
+                    return build_orchestrator(
+                        settings,
+                        llm=llm,
+                        retriever=rag.retriever,
+                        pending=pending,
+                        docs_prompt=registry.get("agent_docs"),
+                        tickets_prompt=registry.get("agent_tickets"),
+                        classifier=LLMIntentClassifier(
+                            llm, system=registry.get("triage").text, model=settings.model_light
+                        ),
+                    )
+                return build_agent(
                     settings,
                     llm=llm,
                     retriever=rag.retriever,
-                    pending=InMemoryPendingStore(),
+                    pending=pending,
                     answer_prompt=answer_prompt,
-                ),
+                )
+
+            graded = await run_answers_eval(
+                make_agent,
                 cases,
                 judge_fn,
                 concurrency=args.concurrency,
@@ -156,6 +177,7 @@ async def cmd_answers(args: argparse.Namespace) -> int:
                 "answer_model": settings.model_answer,
                 "judge_model": settings.model_judge,
                 "answer_prompt": answer_prompt.ref,
+                "architecture": settings.architecture,
                 "answer_prompt_sha": answer_prompt.sha,
                 "embedder": rag.embedder.name,
                 "reranker": rag.reranker.name,
@@ -276,6 +298,7 @@ def main() -> None:
     a.add_argument("--concurrency", type=int, default=4)
     a.add_argument("--answer-prompt-version", type=int)
     a.add_argument("--model")
+    a.add_argument("--architecture", choices=["single", "multi"])
     a.add_argument("--judge-model")
     a.add_argument("--offline", action="store_true")
     a.add_argument("--out", type=Path)

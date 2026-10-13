@@ -1,4 +1,4 @@
-.PHONY: up down smoke load docker-build dev dev-offline test test-integration lint fmt typecheck check db ingest eval-retrieval eval-answers eval-calibrate
+.PHONY: bench-vector finetune mcp up down smoke load docker-build dev dev-offline test test-integration lint fmt typecheck check db ingest eval-retrieval eval-answers eval-calibrate
 
 dev:
 	uv run uvicorn --factory docspilot.api.app:create_app --reload --port 8000
@@ -62,3 +62,16 @@ smoke:
 # against a locally started server with DOCSPILOT_LLM_BACKEND=fake and limits disabled
 load:
 	uv run python scripts/loadtest.py http://127.0.0.1:8000 -n 200 -c 20
+
+# ---- phase 8 experiments -------------------------------------------------------------
+bench-vector:
+	DATABASE_URL=postgresql://docspilot:docspilot@127.0.0.1:5433/docspilot \
+	  uv run python -m docspilot.bench.vector_bench -n 50000 --noise 3.0
+
+# torch has no wheels for the newest Python: use a dedicated 3.12 environment
+finetune:
+	UV_PROJECT_ENVIRONMENT=.venv-ft uv sync --extra finetune --python 3.12
+	UV_PROJECT_ENVIRONMENT=.venv-ft uv run --python 3.12 python -m docspilot.finetune compare --lora
+
+mcp:
+	uv run python -m docspilot.mcp_server

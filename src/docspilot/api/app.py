@@ -13,9 +13,11 @@ from opentelemetry.sdk.trace.export import SpanExporter
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 
 from docspilot import __version__
-from docspilot.agent.factory import build_agent
+from docspilot.agent.factory import build_agent, build_orchestrator
+from docspilot.agent.mcp_tools import client_for, load_remote_tools, parse_server_specs
 from docspilot.agent.pending import InMemoryPendingStore, PendingStore
 from docspilot.agent.pending_pg import PostgresPendingStore
+from docspilot.agent.tools import Tool
 from docspilot.api.chat import router as chat_router
 from docspilot.api.debug import router as debug_router
 from docspilot.api.feedback import router as feedback_router
@@ -25,10 +27,16 @@ from docspilot.api.middleware import (
     SecurityHeadersMiddleware,
 )
 from docspilot.api.triage import router as triage_router
-from docspilot.auth import ApiKeyAuthenticator, parse_api_keys
+from docspilot.auth import (
+    ApiKeyAuthenticator,
+    ChainAuthenticator,
+    OIDCAuthenticator,
+    parse_api_keys,
+)
 from docspilot.budget import Budget, InMemorySpendStore, PostgresSpendStore
 from docspilot.cache import CorpusVersionProvider, ResponseCache
 from docspilot.config import Settings, get_settings
+from docspilot.intents import IntentClassifier, LLMIntentClassifier
 from docspilot.llm.client import AnthropicLLM, build_anthropic_client
 from docspilot.llm.fake import FakeLLM, Script
 from docspilot.llm.instrumented import InstrumentedLLM
@@ -94,9 +102,18 @@ def create_app(
             rag = await stack.enter_async_context(build_rag(settings))
             app.state.rag = rag
             app.state.tickets = rag.tickets
-            app.state.authenticator = ApiKeyAuthenticator(
-                parse_api_keys(settings.api_keys.get_secret_value()) if settings.api_keys else {}
-            )
+            oidc = None
+            if settings.oidc_issuer and settings.oidc_audience:
+                oidc = OIDCAuthenticator(
+                    issuer=settings.oidc_issuer,
+                    audience=settings.oidc_audience,
+                    jwks_url=settings.oidc_jwks_url,
+                    algorithms=tuple(a.strip() for a in settings.oidc_algorithms.split(",")),
+                    user_claim=settings.oidc_user_claim,
+                )
+                stack.push_async_callback(oidc.aclose)
+            keys = parse_api_keys(settings.api_keys.get_secret_value()) if settings.api_keys else {}
+            app.state.authenticator = ChainAuthenticator(oidc, ApiKeyAuthenticator(keys))
             app.state.rate_limiter = RateLimiter(
                 per_minute=settings.rate_limit_per_min, burst=settings.rate_limit_burst
             )
@@ -121,14 +138,49 @@ def create_app(
             )
             app.state.pending = pending_store
             rag.retriever.attach_telemetry(telemetry)
-            app.state.agent = build_agent(
-                settings,
-                llm=app.state.llm,
-                retriever=rag.retriever,
-                pending=app.state.pending,
-                answer_prompt=answer_prompt,
-                telemetry=telemetry,
-            )
+            classifier: IntentClassifier
+            if settings.router_backend == "local":
+                from docspilot.local_classifier import LocalIntentClassifier
+
+                assert settings.router_model_dir is not None, "DOCSPILOT_ROUTER_MODEL_DIR"
+                classifier = LocalIntentClassifier.load(settings.router_model_dir)
+            else:
+                classifier = LLMIntentClassifier(
+                    app.state.llm,
+                    system=registry.get("triage").text,
+                    model=settings.model_light,
+                )
+            app.state.intent_classifier = classifier
+            if settings.architecture == "multi":
+                docs_prompt = registry.get("agent_docs")
+                app.state.agent = build_orchestrator(
+                    settings,
+                    llm=app.state.llm,
+                    retriever=rag.retriever,
+                    pending=app.state.pending,
+                    docs_prompt=docs_prompt,
+                    tickets_prompt=registry.get("agent_tickets"),
+                    classifier=classifier,
+                    telemetry=telemetry,
+                )
+                app.state.answer_prompt = docs_prompt  # cache key follows the docs prompt
+            else:
+                external: list[Tool] = []
+                for name, target in parse_server_specs(settings.mcp_servers):
+                    mcp_client = await stack.enter_async_context(client_for(target))
+                    external += await load_remote_tools(
+                        mcp_client, server_name=name, policy=settings.injection_policy
+                    )
+                    log.info("mcp_server_connected", server=name, tools=len(external))
+                app.state.agent = build_agent(
+                    settings,
+                    llm=app.state.llm,
+                    retriever=rag.retriever,
+                    pending=app.state.pending,
+                    answer_prompt=answer_prompt,
+                    telemetry=telemetry,
+                    extra_tools=external,
+                )
             app.state.response_cache = ResponseCache(
                 ttl_s=settings.response_cache_ttl_s, max_items=settings.response_cache_max_items
             )

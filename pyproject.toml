@@ -19,13 +19,29 @@ dependencies = [
   "opentelemetry-sdk>=1.27",
   "opentelemetry-exporter-otlp-proto-http>=1.27",
   "prometheus-client>=0.21",
+  "pyjwt[crypto]>=2.9",
+  "mcp>=1.2",
+  "jsonschema>=4.23",
 ]
+
+[project.optional-dependencies]
+# Local intent classifier (fine-tuning experiment). Not needed to run the service.
+finetune = [
+  "scikit-learn>=1.5",
+  "torch>=2.4",
+  "transformers>=4.45",
+  "peft>=0.13",
+  "accelerate>=1.0",
+  "numpy>=1.26",
+]
+langgraph = ["langgraph>=0.2", "langchain-core>=0.3"]
 
 [dependency-groups]
 dev = [
   "pytest>=8.3",
   "pytest-asyncio>=0.24",
   "types-pyyaml",
+  "numpy>=1.26",  # benchmarks / experiments only
   "ruff>=0.8",
   "mypy>=1.13",
 ]
@@ -54,9 +70,17 @@ ignore = ["S101"]
 
 [tool.ruff.lint.per-file-ignores]
 "tests/**" = ["S"]
+# synthetic-data generation uses `random` deliberately (not for security)
+"src/docspilot/finetune/**" = ["S311", "T201", "E501"]
+"scripts/**" = ["S310"]
+"src/docspilot/bench/**" = ["E501", "T201", "E731", "S608"]
 
 [tool.mypy]
 python_version = "3.12"
 strict = true
 plugins = ["pydantic.mypy"]
 mypy_path = "src"
+
+[[tool.mypy.overrides]]
+module = ["torch.*", "peft.*", "transformers.*", "sklearn.*", "langgraph.*", "langchain_core.*", "jsonschema.*"]
+ignore_missing_imports = true

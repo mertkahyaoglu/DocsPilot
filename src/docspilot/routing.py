@@ -1,10 +1,10 @@
-"""Optional front door: a small model classifies the first message; chit-chat is
-answered by the small model with no tools, everything else goes to the full agent.
+"""Optional front door: a classifier labels the first message; chit-chat is answered by
+the small model with no tools, everything else goes to the full agent.
 
-This is a *trade*, not a free win: every non-chit-chat request pays one extra small-
-model round trip (cost and ~0.3-1s latency). It only pays off when a meaningful share
-of traffic is easy. Measure (evals + `docspilot_route_total`) before enabling.
-It fails open: any routing error sends the request to the full agent."""
+This is a *trade*, not a free win: every non-chit-chat request pays one extra
+classification round trip (cost and, for an LLM classifier, ~0.3-1s). It only pays off
+when a meaningful share of traffic is easy. Measure (evals + `docspilot_route_total`)
+before enabling. It fails open: any routing error sends the request to the full agent."""
 
 from __future__ import annotations
 
@@ -12,37 +12,30 @@ from collections.abc import AsyncGenerator
 from typing import Literal
 
 from docspilot.agent.loop import AgentEvent, AgentFinished
-from docspilot.llm.errors import LLMError
+from docspilot.intents import Intent, IntentClassifier
 from docspilot.llm.types import LLM, LLMRequest, LLMResult, TextDelta, Usage
 from docspilot.logging import get_logger
-from docspilot.triage import Triage, TriageError, triage
 
 log = get_logger("routing")
 Route = Literal["agent", "smalltalk"]
 
-
-async def choose_route(llm: LLM, *, message: str, triage_prompt: str, model: str) -> Route:
-    try:
-        result, _ = await triage(
-            llm, message=message, system=triage_prompt, model=model, purpose="route"
-        )
-    except (TriageError, LLMError):
-        log.warning("routing_failed_open")
-        return "agent"
-    except Exception:
-        log.exception("routing_crashed_failed_open")
-        return "agent"
-    return route_for(result, message)
-
-
 MAX_SMALLTALK_CHARS = 160
 
 
-def route_for(t: Triage, message: str) -> Route:
+async def choose_route(classifier: IntentClassifier, *, message: str) -> Route:
+    try:
+        intent = await classifier.classify(message)
+    except Exception:
+        log.warning("routing_failed_open", classifier=classifier.name, exc_info=True)
+        return "agent"
+    return route_for(intent, message)
+
+
+def route_for(intent: Intent, message: str) -> Route:
     # Only the unambiguous case is diverted: classified small talk AND short. A long
     # message that mixes a greeting with a real request ("thanks! also open a ticket
     # about...") must reach the agent, which has the tools.
-    if t.intent == "smalltalk" and len(message) <= MAX_SMALLTALK_CHARS:
+    if intent == "smalltalk" and len(message) <= MAX_SMALLTALK_CHARS:
         return "smalltalk"
     return "agent"
 

@@ -33,7 +33,7 @@ docker compose -f docker-compose.yml -f docker-compose.observability.yml up -d  
 | 5 | Observability & cost: OTel traces, Prometheus, caching, routing | ✅ |
 | 6 | Safety: injection defence, output guard, auth, limits, budgets | ✅ |
 | 7 | Ship: Docker, CI, failover, degraded mode, shared state, runbook | ✅ |
-| 8 | Multi-agent, MCP, scaling, fine-tuning, OIDC | ⏳ |
+| 8 | OIDC, multi-agent, MCP, vector scaling benchmark, fine-tuned router | ✅ |
 
 `corpus/` holds the sample "Acme Billing" docs, including deliberate traps (a contradicting
 older policy, an unanswerable-topic gap, and a document containing a prompt-injection
@@ -44,3 +44,5 @@ attempt) that later phases evaluate and defend against.
 - [`LEARN.md`](LEARN.md): the concepts behind each phase
 - [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md): request flow, failure behaviour, state
 - [`docs/RUNBOOK.md`](docs/RUNBOOK.md): operating it, debugging a bad answer from a trace
+- [`docs/SCALING.md`](docs/SCALING.md): measured pgvector index trade-offs, when to leave Postgres
+- [`docs/FINETUNING.md`](docs/FINETUNING.md): TF-IDF vs LoRA vs prompted router, and what the numbers do (not) say

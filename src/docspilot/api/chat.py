@@ -505,12 +505,7 @@ async def _routed(
 ) -> AsyncGenerator[AgentEvent, None]:
     llm: LLM = request.app.state.llm
     prompts: PromptRegistry = request.app.state.prompts_registry
-    route = await choose_route(
-        llm,
-        message=question,
-        triage_prompt=prompts.get("triage").text,
-        model=settings.model_light,
-    )
+    route = await choose_route(request.app.state.intent_classifier, message=question)
     tel.metrics.route.labels(route).inc()
     if route == "smalltalk":
         if slot is not None:

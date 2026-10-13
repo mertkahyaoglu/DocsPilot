@@ -9,7 +9,7 @@ import re
 import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field, replace
-from typing import Any, ClassVar
+from typing import Any
 
 import anthropic
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
@@ -75,11 +75,13 @@ class ToolInput(BaseModel):
 
 
 class Tool(ABC):
-    name: ClassVar[str]
-    description: ClassVar[str]
-    input_model: ClassVar[type[ToolInput]]
+    # Plain attributes (not ClassVar): static tools set them on the class, adapters for
+    # remote tools (MCP) set them per instance.
+    name: str
+    description: str
+    input_model: type[ToolInput]
     #: Side-effecting tools never run until a human approves the exact arguments.
-    requires_confirmation: ClassVar[bool] = False
+    requires_confirmation: bool = False
 
     def spec(self) -> dict[str, Any]:
         return {

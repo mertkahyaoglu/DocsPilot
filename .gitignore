@@ -21,3 +21,5 @@ dist/
 .vscode/
 evals/results/
 *.log
+.venv-*/
+finetune_out/
