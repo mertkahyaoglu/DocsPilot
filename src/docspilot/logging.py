@@ -73,7 +73,9 @@ def configure_logging(settings: Settings) -> None:
             renderer,
         ],
         wrapper_class=structlog.make_filtering_bound_logger(level),
-        logger_factory=structlog.PrintLoggerFactory(file=sys.stdout),
+        logger_factory=structlog.PrintLoggerFactory(
+            file=sys.stderr if settings.log_stream == "stderr" else sys.stdout
+        ),
         cache_logger_on_first_use=True,
     )
 

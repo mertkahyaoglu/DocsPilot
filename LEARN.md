@@ -622,3 +622,116 @@ test the service itself without spending credits.
 | Everything slow during a provider incident | no breaker / timeouts too high | `breakers` in `/readyz`, `llm_failover` logs |
 | Users see doc excerpts instead of answers | degraded mode active | `docspilot_degraded_answers_total`, provider status |
 | Streams cut at deploy | shutdown grace shorter than stream duration | `--timeout-graceful-shutdown`, orchestrator grace period |
+
+---
+
+## Phase 8: Advanced topics
+
+Five things that are easy to over-apply. For each: what it is, what it costs, and the
+measured or reasoned answer to "do we need it here?".
+
+### 1. OIDC authentication (`auth.py`)
+API keys identify *services*; users authenticate with an identity provider and present a
+short-lived JWT. `OIDCAuthenticator` verifies it against the issuer's JWKS and plugs into
+the same two-method `Authenticator` interface (`ChainAuthenticator` routes JWT-shaped tokens
+to OIDC and the rest to API keys). The checks that matter, each with a test:
+- algorithm **allow-list** (blocks `alg: none` and RS256->HS256 key confusion; PyJWT will
+  not even create the attack token, the test assembles it by hand);
+- `iss`, `aud`, `exp` required, `nbf` honoured, small leeway; the user id comes from a
+  configured claim and must not be a reserved id;
+- key selection by `kid` from the issuer's JWKS, **never from the token**;
+- **JWKS caching with rate-limited refresh**: an unknown `kid` triggers at most one refresh
+  per window (rotation works; a flood of junk tokens cannot turn the IdP into a target); an
+  IdP outage keeps serving with cached keys.
+Token *acquisition* (login redirect, PKCE) is the IdP's/front end's job, not the API's.
+
+### 2. Multi-agent: split for *privilege*, not for fashion (`agent/orchestrator.py`)
+A router in front of two specialists:
+| specialist | tools | sees untrusted documents? | model |
+|---|---|---|---|
+| docs | `search_docs` | yes | answer model |
+| tickets | `create_ticket` (human-gated), `get_ticket` | **no** | cheaper model |
+
+The reason to split is the **dual-LLM / privilege separation** pattern: the agent that reads
+poisoned text has nothing dangerous to call (a test shows an "injected" docs agent hitting
+`Unknown tool`), and the agent that can act has no retrieval tool, so no retrieved document
+text is placed in its context by a tool. Residual, stated plainly: the conversation history
+it receives is client-supplied and can contain earlier docs-agent answers (model output
+derived from documents); that is bounded by the human confirmation of every write, not by
+isolation. Smaller
+focused prompts and a cheaper model for the simple task are side benefits. Costs: a routing
+hop (latency + a classification error rate), handoff bugs (a "yes" or a detail reply after the ticketing agent asked something must stay
+with it; a misrouted product question must be handed back: `hand_off_to_docs`; the pending
+action remembers which agent paused), and two prompts to keep consistent. Classifier failure routes to the *least
+privileged* specialist. Whether it beats the single agent on quality is empirical:
+
+    uv run python -m docspilot.evals answers --architecture single
+    uv run python -m docspilot.evals answers --architecture multi
+    uv run python -m docspilot.evals compare <a.json> <b.json>
+
+`experiments/langgraph_router.py` re-expresses the same router as a LangGraph `StateGraph`
+(behaviourally equivalent, tested). What it buys here is small; it earns its keep for durable
+multi-step workflows with persistence and branching, not for a two-way router.
+
+### 3. MCP: expose and consume tools (`mcp_server.py`, `agent/mcp_tools.py`)
+- **Server**: the same retrieval (with scanning, neutralising and spotlighting) and ticket
+  capabilities for any MCP client. Tool *annotations* (`readOnlyHint`, ...) tell clients which
+  calls need human approval; we do not rely on them: tickets are per authenticated user.
+  Over HTTP every request needs a bearer credential and the server refuses to start without
+  auth. Claude Desktop / Claude Code config:
+  ```json
+  {"mcpServers": {"docspilot": {
+    "command": "uv",
+    "args": ["--directory", "/path/to/DocsPilot", "run", "python", "-m", "docspilot.mcp_server"],
+    "env": {"VOYAGE_API_KEY": "...", "DATABASE_URL": "postgresql://..."}}}}
+  ```
+- **Client**: `DOCSPILOT_MCP_SERVERS="name=https://host/mcp"` adds an external server's tools
+  to the agent. An MCP server is a **supply-chain dependency whose output is attacker-
+  controllable**: results are scanned/neutralised/wrapped like documents, tools default to
+  requiring human approval unless marked read-only, arguments are validated against the
+  remote JSON schema locally, and plaintext remote transports are refused.
+
+### 4. Vector search at scale (`bench/`, `docs/SCALING.md`)
+Measured on 50k x 1024 vectors: exact scan ~165 ms; IVFFlat 5-9 s build, recall depends on
+data structure (0.69-0.82 on diffuse data, and it varied ~0.1 between runs); HNSW 31-53 s
+build, recall 0.94 @ ef=40 and 0.98 @ 100-200 at 2.4-8.5 ms; `halfvec` makes the index 3x
+smaller for ~0.01 recall.
+Conclusions that generalise: tune `ef_search` against your *eval set*; RAM, not CPU, is the
+limit; use half precision before reaching for a new database; Postgres stays the right home
+until you are well past 10^7 vectors or vector load hurts OLTP. This repo's 109 chunks need
+no index at all.
+
+### 5. Fine-tuning (`finetune/`, `docs/FINETUNING.md`)
+We trained the intent router two ways on synthetic data: TF-IDF + logistic regression
+(0.13 MB, 0.01 ms, 2 s) and DistilBERT + LoRA (0.74M trainable params, 269 MB merged,
+12-15 ms, ~20 s). LoRA won big on held-out templates (0.88 vs 0.72) but on the
+independently-ish written golden questions the models are **statistically indistinguishable**
+(TF-IDF 0.817 vs LoRA 0.767 +/- 0.049 across seeds; single seeds ranged 0.72-0.83). A first
+run, before removing 6 train/test duplicates, gave a different winner. Lessons: build the
+cheap baseline first; never judge on data you generated; report seeds and intervals; a
+single n=60 number is a coin flip. Fine-tune only with real labels, high call volume and a
+held-out production sample showing parity. For *answer quality* here, retrieval, prompts and
+evals are the right tools, not weights.
+
+### What to carry away
+- Every "advanced" feature came with a way to *measure* whether it was worth it
+  (`evals --architecture`, `vector_bench`, `finetune compare`); that is the skill.
+- Security architecture beats security prompts: privilege separation, untrusted-by-default
+  tool output, human gates, validated inputs from every protocol boundary.
+- Honest limits: nothing here was evaluated against live model quality (no API key in the
+  build environment). `make eval-answers`, `make eval-calibrate`, and the `--llm` fine-tune
+  comparison are ready and are the first things to run with keys.
+
+### Review lessons specific to this phase
+- **Every channel that reaches the model is an injection channel**, including tool
+  *descriptions*, schema property descriptions and *error text* from a remote MCP server.
+  Self-asserted metadata (`readOnlyHint`) is a claim, not a fact.
+- **Schema validation can be an SSRF primitive**: JSON-Schema `$ref` resolution may fetch
+  URLs. Validate with an empty registry and reject non-local refs.
+- **stdio transports own stdout**: anything else that prints there corrupts the protocol.
+  Logs go to stderr in that mode.
+- **Verify an index is used** (`EXPLAIN`) before benchmarking it, clean up after failures,
+  and run randomized builds more than once.
+- **IdP outage is 503, not 401** (do not log users out), failed refreshes must start a
+  cool-down *after* the attempt, and keys of the wrong type must be filtered before they
+  reach signature code (otherwise an unauthenticated request is a 500).

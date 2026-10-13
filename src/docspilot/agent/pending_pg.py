@@ -60,6 +60,7 @@ def decode(data: dict[str, Any]) -> PendingAction:
         usage=Usage(**data["usage"]),
         steps=data["steps"],
         retrieved={k: source(v) for k, v in data["retrieved"].items()},
+        agent=data.get("agent", ""),
     )
 
 

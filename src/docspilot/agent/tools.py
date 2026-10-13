@@ -9,7 +9,7 @@ import re
 import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field, replace
-from typing import Any, ClassVar
+from typing import Any
 
 import anthropic
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
@@ -75,11 +75,13 @@ class ToolInput(BaseModel):
 
 
 class Tool(ABC):
-    name: ClassVar[str]
-    description: ClassVar[str]
-    input_model: ClassVar[type[ToolInput]]
+    # Plain attributes (not ClassVar): static tools set them on the class, adapters for
+    # remote tools (MCP) set them per instance.
+    name: str
+    description: str
+    input_model: type[ToolInput]
     #: Side-effecting tools never run until a human approves the exact arguments.
-    requires_confirmation: ClassVar[bool] = False
+    requires_confirmation: bool = False
 
     def spec(self) -> dict[str, Any]:
         return {
@@ -341,6 +343,25 @@ _PATH_OK = re.compile(r"[^A-Za-z0-9_\-./]")
 def _safe_path(path: str) -> str:
     """Paths are cited back verbatim, so they must be inert: no spaces/markup/unicode."""
     return _PATH_OK.sub("_", path)[:200]
+
+
+class HandoffInput(ToolInput):
+    pass
+
+
+class HandoffToDocsTool(Tool):
+    """Lets the ticketing specialist hand a misrouted product question back. The
+    orchestrator intercepts the call: this tool never actually executes."""
+
+    name = "hand_off_to_docs"
+    description = (
+        "Call this, with no text before it, when the user's message is a product question "
+        "that needs the documentation rather than a ticket (you cannot search the docs)."
+    )
+    input_model = HandoffInput
+
+    async def run(self, args: Any, ctx: ToolContext) -> dict[str, Any]:  # pragma: no cover
+        return {"handoff": "docs"}
 
 
 def default_tools(

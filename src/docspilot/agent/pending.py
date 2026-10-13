@@ -41,6 +41,7 @@ class PendingAction:
     usage: Usage = field(default_factory=Usage)  # carried so `done` reports the whole turn
     steps: int = 0
     retrieved: dict[str, Source] = field(default_factory=dict)
+    agent: str = ""  # name of the (specialist) agent that paused
     claimed_until: float = 0.0
 
 

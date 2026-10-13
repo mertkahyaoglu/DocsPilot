@@ -8,7 +8,7 @@ from typing import Annotated
 
 from fastapi import Depends, HTTPException, Request
 
-from docspilot.auth import Authenticator
+from docspilot.auth import Authenticator, AuthUnavailableError
 from docspilot.budget import Budget, BudgetExceeded
 from docspilot.ratelimit import RateLimiter
 
@@ -23,7 +23,12 @@ def _bearer(request: Request) -> str | None:
 
 async def authenticated_user(request: Request) -> str:
     auth: Authenticator = request.app.state.authenticator
-    principal = auth.authenticate(_bearer(request))
+    try:
+        principal = await auth.authenticate(_bearer(request))
+    except AuthUnavailableError:
+        raise HTTPException(
+            503, "authentication is temporarily unavailable", headers={"Retry-After": "5"}
+        ) from None
     if principal is None:
         request.app.state.telemetry.metrics.rejections.labels("unauthenticated").inc()
         raise HTTPException(401, "authentication required", headers={"WWW-Authenticate": "Bearer"})

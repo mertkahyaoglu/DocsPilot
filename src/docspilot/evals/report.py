@@ -152,7 +152,7 @@ def check_answers_baseline(
     category 20-33 points, so categories are reported, never gated."""
     problems = []
     if meta is not None:
-        for key in ("judge_model", "embedder", "answer_model"):
+        for key in ("judge_model", "embedder", "answer_model", "architecture"):
             have, want = meta.get(key), baseline.get("meta", {}).get(key)
             if want is not None and have != want:
                 problems.append(f"baseline recorded with {key}={want!r}, this run used {have!r}")

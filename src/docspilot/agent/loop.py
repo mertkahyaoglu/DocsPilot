@@ -120,6 +120,7 @@ class AgentConfig:
     max_steps: int = 6
     tool_timeout_s: float = 15.0
     prompt_caching: bool = False
+    name: str = "main"  # which agent paused: stored with pending actions, used to resume
     prompt_ref: str = ""  # for logs/traces only
     prompt_sha: str = ""
 
@@ -386,6 +387,7 @@ class Agent:
             usage=usage,
             steps=steps,
             retrieved=retrieved,
+            agent=self._config.name,
         )
         await self._pending.put(pending)
         items = []

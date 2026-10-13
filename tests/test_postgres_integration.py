@@ -3,6 +3,7 @@ the test user may CREATE DATABASE (e.g. `docker compose up -d db`)."""
 
 from __future__ import annotations
 
+import asyncio
 import os
 import uuid
 from collections.abc import AsyncIterator
@@ -335,3 +336,22 @@ async def test_pending_release_and_outcome_survive_cancellation_and_use_the_db_c
         assert time.time() > 0
     finally:
         await pool.close()
+
+
+async def test_vector_benchmark_cleans_up_its_schema_even_when_it_fails(dsn: str) -> None:
+    import argparse
+
+    import psycopg
+    import pytest as _pytest
+
+    from docspilot.bench import vector_bench
+
+    args = argparse.Namespace(
+        n=200, dim=3000, clusters=5, queries=5, k=5, seed=1, noise=1.0, dsn=dsn, out=None
+    )
+    # 3000 dims exceeds the IVFFlat limit (2000): the run fails midway, after creating data
+    with _pytest.raises(Exception):  # noqa: B017
+        await asyncio.to_thread(vector_bench.run, args)
+    async with await psycopg.AsyncConnection.connect(dsn) as conn:
+        cur = await conn.execute("SELECT count(*) FROM pg_namespace WHERE nspname LIKE 'bench_%'")
+        assert (await cur.fetchone()) == (0,)

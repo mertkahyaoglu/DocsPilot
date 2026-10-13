@@ -281,13 +281,15 @@ async def test_message_that_is_only_control_characters_is_rejected(
 KEYS = "alice:alice-secret-key-0001,bob:bob-secret-key-00002"
 
 
-def test_api_key_authenticator_and_parser() -> None:
+async def test_api_key_authenticator_and_parser() -> None:
     auth = ApiKeyAuthenticator(parse_api_keys(KEYS))
     assert auth.required
-    assert auth.authenticate("alice-secret-key-0001").user_id == "alice"  # type: ignore[union-attr]
-    assert auth.authenticate("alice-secret-key-0002") is None
-    assert auth.authenticate(None) is None
-    assert ApiKeyAuthenticator({}).authenticate(None).user_id == "anonymous"  # type: ignore[union-attr]
+    alice = await auth.authenticate("alice-secret-key-0001")
+    assert alice is not None and alice.user_id == "alice"
+    assert await auth.authenticate("alice-secret-key-0002") is None
+    assert await auth.authenticate(None) is None
+    anon = await ApiKeyAuthenticator({}).authenticate(None)
+    assert anon is not None and anon.user_id == "anonymous"
     for bad in ("alice", "alice:short", ":a-very-long-key-0000001"):
         with pytest.raises(ValueError):
             parse_api_keys(bad)

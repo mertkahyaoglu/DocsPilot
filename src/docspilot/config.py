@@ -30,6 +30,8 @@ class Settings(BaseSettings):
     env: Literal["dev", "test", "staging", "prod"] = "dev"
     log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR"] = "INFO"
     log_json: bool = False
+    #: stdio MCP servers speak JSON-RPC on stdout: their logs must go to stderr.
+    log_stream: Literal["stdout", "stderr"] = "stdout"
 
     # The SDK also reads ANTHROPIC_API_KEY itself; we surface it for fail-fast validation.
     anthropic_api_key: SecretStr | None = Field(default=None, validation_alias="ANTHROPIC_API_KEY")
@@ -40,6 +42,12 @@ class Settings(BaseSettings):
     # --- safety ---
     #: "user:key,user2:key2" (keys >= 16 chars). Required in prod; unset in dev = anonymous.
     api_keys: SecretStr | None = Field(default=None, validation_alias="DOCSPILOT_API_KEYS")
+    # OIDC (Clerk/Auth0/Okta/Entra/Keycloak...): set issuer + audience to accept their JWTs.
+    oidc_issuer: str | None = None
+    oidc_audience: str | None = None
+    oidc_jwks_url: str | None = None  # default: discovered from the issuer
+    oidc_algorithms: str = "RS256"  # comma separated, asymmetric only
+    oidc_user_claim: str = "sub"
     injection_policy: Literal["off", "annotate", "redact"] = "redact"
     #: Hosts the answer may link to / mention (subdomains included), comma separated.
     allowed_hosts: str = "acmebilling.example"
@@ -103,6 +111,20 @@ class Settings(BaseSettings):
     web_dir: Path = PROJECT_ROOT / "web"
     answer_prompt_version: int | None = None  # None = latest
 
+    #: single agent with all tools, or router + least-privilege specialists (docs / tickets)
+    architecture: Literal["single", "multi"] = "single"
+    model_tickets: str = "claude-sonnet-5-5"  # the ticketing specialist's model (multi only)
+    #: who classifies intent for routing: the prompted small model or a local fine-tune
+    router_backend: Literal["llm", "local"] = "llm"
+    router_model_dir: Path | None = None
+
+    #: External MCP servers whose tools the (single) agent may use: "name=https://host/mcp,
+    #: name2=stdio:python -m some_server". Their output is treated as untrusted data.
+    mcp_servers: str = ""
+    #: Honour remote `readOnlyHint` (skips the human gate). Off: the remote is not trusted
+    #: to describe its own side effects.
+    mcp_trust_read_only: bool = False
+
     max_agent_steps: int = Field(default=6, ge=1, le=20)
     tool_timeout_s: float = Field(default=15.0, gt=0)
     confirmation_ttl_s: int = Field(default=600, ge=30)
@@ -140,6 +162,9 @@ class Settings(BaseSettings):
         "otlp_endpoint",
         "metrics_token",
         "api_keys",
+        "oidc_issuer",
+        "oidc_audience",
+        "oidc_jwks_url",
         mode="before",
     )
     @classmethod
@@ -160,8 +185,11 @@ class Settings(BaseSettings):
         if self.strict and self.resolved_embedder == "hash":
             raise ValueError("a real embedder (VOYAGE_API_KEY) is required outside dev/test")
         if self.strict:
-            if self.api_keys is None:
-                raise ValueError("DOCSPILOT_API_KEYS is required outside dev/test")
+            if self.api_keys is None and not self.oidc_issuer:
+                raise ValueError(
+                    "authentication is required outside dev/test: set DOCSPILOT_API_KEYS "
+                    "or DOCSPILOT_OIDC_ISSUER + DOCSPILOT_OIDC_AUDIENCE"
+                )
             if self.injection_policy == "off":
                 raise ValueError("DOCSPILOT_INJECTION_POLICY must not be 'off' outside dev/test")
             if not self.output_guard:
@@ -170,6 +198,12 @@ class Settings(BaseSettings):
                 raise ValueError("a rate limit is required outside dev/test")
             if self.user_daily_budget_usd <= 0 or self.global_daily_budget_usd <= 0:
                 raise ValueError("daily budgets are required outside dev/test")
+        if bool(self.oidc_issuer) != bool(self.oidc_audience):
+            raise ValueError("DOCSPILOT_OIDC_ISSUER and DOCSPILOT_OIDC_AUDIENCE go together")
+        if self.strict:
+            for url in (self.oidc_issuer, self.oidc_jwks_url):
+                if url and not url.startswith("https://"):
+                    raise ValueError("OIDC issuer and JWKS URLs must be https:// outside dev/test")
         if "voyage" in (self.embedder, self.rerank) and self.voyage_api_key is None:
             raise ValueError("VOYAGE_API_KEY is required for embedder/rerank=voyage")
         if self.rerank_min_score is not None and self.resolved_rerank == "none":
