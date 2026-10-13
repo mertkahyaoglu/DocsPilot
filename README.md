@@ -19,7 +19,7 @@ make check                  # ruff + mypy + pytest
 | Phase | Topic | State |
 |---|---|---|
 | 1 | Foundation: Claude client, streaming, prompts, config | ✅ |
-| 2 | Tool use, structured output | ⏳ |
+| 2 | Tool use, human confirmation, structured output | ✅ |
 | 3 | RAG | ⏳ |
 | 4 | Evals | ⏳ |
 | 5 | Observability, cost | ⏳ |

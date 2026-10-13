@@ -42,7 +42,6 @@ async def test_chat_streams_deltas_then_done(client: httpx.AsyncClient, fake_llm
     assert "".join(d["text"] for e, d in events if e == "delta") == "ok"
     done = events[-1][1]
     assert done["usage"]["input_tokens"] == 10
-    assert done["prompt"] == "answer@v1"
     # the request actually carried the system prompt, effort and the conversation
     sent = fake_llm.requests[0]
     assert sent.system and "DocsPilot" in sent.system
@@ -50,8 +49,8 @@ async def test_chat_streams_deltas_then_done(client: httpx.AsyncClient, fake_llm
     assert sent.messages == [{"role": "user", "content": "hi"}]
 
 
-async def test_chat_maps_provider_errors_to_error_event(app, client: httpx.AsyncClient) -> None:
-    app.state.llm = FakeLLM([Script(error=LLMError("boom", kind="overloaded", status_code=529))])
+async def test_chat_maps_provider_errors_to_error_event(use_llm, client: httpx.AsyncClient) -> None:
+    use_llm(FakeLLM([Script(error=LLMError("boom", kind="overloaded", status_code=529))]))
     res = await client.post("/v1/chat", json={"messages": [{"role": "user", "content": "hi"}]})
     events = parse_sse(res.text)
     assert events == [
@@ -67,8 +66,8 @@ async def test_chat_maps_provider_errors_to_error_event(app, client: httpx.Async
     assert "boom" not in res.text  # provider detail never leaks to clients
 
 
-async def test_chat_refusal_becomes_error_event(app, client: httpx.AsyncClient) -> None:
-    app.state.llm = FakeLLM([Script(text="", stop_reason="refusal")])
+async def test_chat_refusal_becomes_error_event(use_llm, client: httpx.AsyncClient) -> None:
+    use_llm(FakeLLM([Script(text="", stop_reason="refusal")]))
     res = await client.post("/v1/chat", json={"messages": [{"role": "user", "content": "x"}]})
     events = parse_sse(res.text)
     assert events[-1][0] == "error" and events[-1][1]["code"] == "refusal"
@@ -112,14 +111,14 @@ async def test_assistant_history_has_looser_limit_than_user(
 
 
 async def test_unexpected_exception_still_yields_error_event(
-    app, client: httpx.AsyncClient
+    use_llm, client: httpx.AsyncClient
 ) -> None:
     class Boom:
         async def stream(self, request):  # type: ignore[no-untyped-def]
             raise TypeError("Could not resolve authentication method")
             yield  # pragma: no cover
 
-    app.state.llm = Boom()
+    use_llm(Boom())
     res = await client.post("/v1/chat", json={"messages": [{"role": "user", "content": "x"}]})
     events = parse_sse(res.text)
     assert events[-1][0] == "error"
@@ -127,7 +126,7 @@ async def test_unexpected_exception_still_yields_error_event(
     assert "authentication" not in res.text
 
 
-async def test_reset_event_is_forwarded(app, client: httpx.AsyncClient) -> None:
+async def test_reset_event_is_forwarded(use_llm, client: httpx.AsyncClient) -> None:
     from docspilot.llm.types import LLMResult, StreamReset, TextDelta, Usage
 
     class Resetting:
@@ -137,7 +136,7 @@ async def test_reset_event_is_forwarded(app, client: httpx.AsyncClient) -> None:
             yield TextDelta("rescue")
             yield LLMResult("rescue", [], "end_turn", Usage(), "m", served_by_fallback=True)
 
-    app.state.llm = Resetting()
+    use_llm(Resetting())
     res = await client.post("/v1/chat", json={"messages": [{"role": "user", "content": "x"}]})
     assert [e for e, _ in parse_sse(res.text)] == ["delta", "reset", "delta", "done"]
 

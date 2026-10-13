@@ -162,6 +162,17 @@ async def test_fallback_resets_stream_and_keeps_only_rescue_text() -> None:
     assert result.served_by_fallback is True
 
 
+async def test_pre_fallback_tool_calls_are_not_executed() -> None:
+    blocks = [
+        SimpleNamespace(type="tool_use", id="old", name="create_ticket", input={}),
+        SimpleNamespace(type="fallback"),
+        SimpleNamespace(type="tool_use", id="new", name="get_ticket", input={}),
+    ]
+    llm, _ = llm_for(FakeStream([], message(stop_reason="tool_use", blocks=blocks)), fallback=True)
+    result = await complete(llm, REQ)
+    assert [c.id for c in result.tool_calls] == ["new"]
+
+
 def _status_error(
     cls: type[anthropic.APIStatusError], status: int, body: object = None
 ) -> anthropic.APIStatusError:
