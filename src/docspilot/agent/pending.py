@@ -13,7 +13,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
-from docspilot.agent.tools import ToolOutcome
+from docspilot.agent.tools import Source, ToolOutcome
 from docspilot.llm.types import ToolCall, Usage
 
 CLAIM_TIMEOUT_S = 60.0
@@ -40,6 +40,7 @@ class PendingAction:
     expires_at: float
     usage: Usage = field(default_factory=Usage)  # carried so `done` reports the whole turn
     steps: int = 0
+    retrieved: dict[str, Source] = field(default_factory=dict)
     claimed_until: float = 0.0
 
 

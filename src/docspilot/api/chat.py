@@ -100,6 +100,16 @@ async def _to_sse(events: AsyncGenerator[AgentEvent, None]) -> AsyncIterator[dic
                     elif event.stop_reason == "max_steps":
                         yield _sse("error", _ERROR_STEPS)
                     else:
+                        if event.citations:
+                            yield _sse(
+                                "citations",
+                                {
+                                    "sources": [
+                                        {"path": c.path, "title": c.title, "section": c.section}
+                                        for c in event.citations
+                                    ]
+                                },
+                            )
                         yield _sse(
                             "done",
                             {

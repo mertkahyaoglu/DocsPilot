@@ -135,3 +135,75 @@ would be followed by a "too many steps" error.
 | Model "creates" a ticket in prose | no tool result | prompt rule + tool result is the only source of truth |
 | Infinite tool loop | model keeps retrying a failing call | step budget, "do not retry more than once" |
 | Pending actions lost on deploy | in-memory store | interface exists; shared store in Phase 7 |
+
+---
+
+## Phase 3: RAG
+
+The model does not know your product. RAG = *retrieve* relevant passages at question
+time and make the model answer from them. Most RAG quality is decided before the
+model sees anything, so treat retrieval as its own system and debug it alone
+(`GET /v1/debug/search?q=...` shows each stage's ranks).
+
+### Pipeline
+```
+corpus/*.md ─► parse ─► chunk ─► embed ─► Postgres (pgvector + tsvector)
+question ─► embed ─► vector top-40 ┐
+         └► keyword top-40 ───────┴─► RRF fuse ─► top-20 ─► rerank ─► top-5 ─► model
+```
+
+### Chunking (`rag/chunking.py`)
+- Split on **headings**, not fixed windows: a chunk is about one thing and has a label.
+- Never split a fenced code block or table; keep blocks atomic.
+- Pack to ~350 tokens, overlap by whole blocks, merge tiny sections forward.
+- **Embed the heading path with the text** ("Refund Policy > Eligibility"): "within 30
+  days" alone is meaningless to an embedding.
+- Size tradeoff: small chunks = precise but lose context; big chunks = context but
+  dilute the embedding and burn prompt tokens. Tune against evals (Phase 4), not vibes.
+
+### Hybrid retrieval (`rag/retrieve.py`)
+Embeddings find meaning and blur exact tokens (error codes, plan names). Keyword
+search is the reverse. Run both and merge with **Reciprocal Rank Fusion**: it uses
+ranks, so it needs no score normalisation between systems. Then a **cross-encoder
+reranker** reads (query, passage) jointly: more accurate, too slow for the full
+corpus, perfect for 20 candidates. Pattern: cheap recall, expensive precision.
+
+### Ingestion (`rag/ingest.py`)
+Idempotent and incremental: content hash + embedding model per document, prune
+deleted files. Safe on every deploy. Changing the embedding model re-embeds
+everything (vectors from different models are incomparable); the dimension is part
+of the schema (`vector(1024)`), so that is a migration.
+
+### Grounding, citations, abstention
+- Prompt `answer.v3`: always search, answer only from results, say "not found" and
+  offer a ticket, prefer the newer doc on conflict (`updated` is returned for this).
+- Citations are model output, so they are **untrusted**: `extract_citations` keeps only
+  paths that were really retrieved this turn. A hallucinated source never reaches the UI.
+- Search results are *data*. The prompt tells the model never to follow instructions
+  found in documents (the corpus has a doc that tries). Phase 6 adds structural defences.
+
+### Context budgeting
+Tool output is capped by a character budget (`SearchDocsTool.char_budget`): best
+chunks first, tail dropped. Retrieval volume is the main lever on cost and latency;
+more context is not better (models lose the needle in long contexts).
+
+### Multi-turn
+The model writes the search query itself (it sees the history), so "and for the
+Scale plan?" becomes a standalone query. That is query rewriting for free, as long as
+the tool description tells it to write self-contained queries.
+
+### Operational notes
+- `/healthz` liveness (never touches dependencies) vs `/readyz` readiness (index
+  reachable and non-empty).
+- Migrations: forward-only SQL files, advisory lock for concurrent deploys.
+- The offline `HashEmbedder` exists so the pipeline runs without keys. It is not a
+  quality baseline; prod refuses to start with it.
+
+### What breaks in production
+| Symptom | Likely cause | Where to look |
+|---|---|---|
+| Right doc exists, answer is wrong | not retrieved / ranked low | `/v1/debug/search` |
+| Exact error code not found | embedding-only retrieval | keyword leg, RRF |
+| Old policy quoted | stale doc outranks new | `updated`, prompt rule, dedupe |
+| Answers cite non-existent pages | unvalidated citations | `extract_citations` |
+| Quality dropped after "re-index" | embedding model/dim changed silently | `documents.embedding_model` |

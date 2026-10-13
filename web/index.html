@@ -28,6 +28,7 @@
   .msg.user { align-self: flex-end; background: var(--user); border-color: transparent; }
   .msg.error { color: var(--error); }
   .meta { color: var(--muted); font-size: 12px; margin-top: 6px; }
+  .sources span { text-decoration: underline dotted; cursor: help; }
   .msg.confirm { border-color: var(--accent); }
   .msg.confirm pre { margin: 8px 0; padding: 8px; border-radius: 8px; font-size: 12px;
                      background: var(--bg); overflow-x: auto; white-space: pre-wrap; }
@@ -135,6 +136,19 @@ async function consume(res, out) {
       out.textContent = state.answer;
     }
     else if (event === "confirmation_required") { state.pending = data; }
+    else if (event === "citations") {
+      const box = document.createElement("div");
+      box.className = "meta sources";
+      box.append("Sources: ");
+      data.sources.forEach((src, i) => {
+        if (i) box.append(" · ");
+        const s = document.createElement("span");
+        s.title = src.section;                 // textContent/title only: never innerHTML
+        s.textContent = src.title;
+        box.appendChild(s);
+      });
+      out.appendChild(box);
+    }
     else if (event === "error") {
       state.answer = ""; state.failed = true;
       out.classList.add("error"); out.textContent = data.message;
