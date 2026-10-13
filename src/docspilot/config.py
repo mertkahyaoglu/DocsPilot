@@ -87,6 +87,13 @@ class Settings(BaseSettings):
     effort_answer: Effort = "medium"
     max_tokens: int = Field(default=16000, ge=256)
 
+    #: Secondary model for the answer path when the primary fails (None disables failover).
+    model_fallback: str | None = "claude-sonnet-5-5"
+    breaker_threshold: int = Field(default=5, ge=1)
+    breaker_recovery_s: float = Field(default=30.0, gt=0)
+    #: Serve retrieval-only answers when no model is available.
+    degraded_mode: bool = True
+
     llm_timeout_s: float = Field(default=60.0, gt=0)
     llm_connect_timeout_s: float = Field(default=5.0, gt=0)
     llm_max_retries: int = Field(default=2, ge=0, le=6)
@@ -144,14 +151,14 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def _require_key_in_prod(self) -> Settings:
-        if self.env == "prod" and self.anthropic_api_key is None:
-            raise ValueError("ANTHROPIC_API_KEY is required when DOCSPILOT_ENV=prod")
-        if self.env == "prod" and self.llm_backend != "anthropic":
-            raise ValueError("DOCSPILOT_LLM_BACKEND must be 'anthropic' in prod")
-        if self.env == "prod" and self.database_url is None:
-            raise ValueError("DATABASE_URL is required when DOCSPILOT_ENV=prod")
-        if self.env == "prod" and self.resolved_embedder == "hash":
-            raise ValueError("a real embedder (VOYAGE_API_KEY) is required in prod")
+        if self.strict and self.anthropic_api_key is None:
+            raise ValueError("ANTHROPIC_API_KEY is required outside dev/test")
+        if self.strict and self.llm_backend != "anthropic":
+            raise ValueError("DOCSPILOT_LLM_BACKEND must be 'anthropic' outside dev/test")
+        if self.strict and self.database_url is None:
+            raise ValueError("DATABASE_URL is required outside dev/test")
+        if self.strict and self.resolved_embedder == "hash":
+            raise ValueError("a real embedder (VOYAGE_API_KEY) is required outside dev/test")
         if self.strict:
             if self.api_keys is None:
                 raise ValueError("DOCSPILOT_API_KEYS is required outside dev/test")

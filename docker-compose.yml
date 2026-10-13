@@ -15,5 +15,30 @@ services:
       timeout: 3s
       retries: 20
 
+  api:
+    build:
+      context: .
+      args:
+        GIT_SHA: ${GIT_SHA:-dev}
+    depends_on:
+      db:
+        condition: service_healthy
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      # compose wires the container to the compose database
+      DATABASE_URL: postgresql://docspilot:docspilot@db:5432/docspilot
+      # `prod` refuses to start without real keys; default to dev for local `up`
+      DOCSPILOT_ENV: ${DOCSPILOT_ENV:-dev}
+      DOCSPILOT_LOG_JSON: "true"
+      # `fake` = canned replies, no API key needed (CI smoke test / UI demo)
+      DOCSPILOT_LLM_BACKEND: ${DOCSPILOT_LLM_BACKEND:-anthropic}
+    ports:
+      - "127.0.0.1:8000:8000"
+    restart: unless-stopped
+    # uvicorn drains for 30s (--timeout-graceful-shutdown); Docker's default would SIGKILL at 10s
+    stop_grace_period: 40s
+
 volumes:
   dbdata:

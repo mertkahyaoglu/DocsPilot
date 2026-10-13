@@ -105,6 +105,17 @@ class Metrics:
             ["reason"],  # unauthenticated | rate_limited | budget_user | budget_global
             registry=r,
         )
+        self.llm_failover = Counter(
+            "docspilot_llm_failover_total",
+            "Calls retried on the secondary model after a provider failure",
+            ["failed", "to"],
+            registry=r,
+        )
+        self.degraded = Counter(
+            "docspilot_degraded_answers_total",
+            "Answers served from retrieval only because generation was unavailable",
+            registry=r,
+        )
         self.llm_fallback = Counter(
             "docspilot_llm_fallback_total",
             "Calls rescued by the refusal-fallback model",

@@ -538,3 +538,87 @@ Phase 4 checks the document attack end to end. Add every real incident here.
 | Users see "can't show that answer" | guard allow-list too narrow (new docs domain) | `output_blocked` reasons |
 | 401 storm after deploy | key rotated, clients cached the old one | `rejections{reason="unauthenticated"}` |
 | Spend cap hit by one user | runaway client or loop | `usage_daily`, per-request `cost_usd` logs |
+
+---
+
+## Phase 7: Ship
+
+"Works on my machine" is the easy part. Production means: it starts the same way
+everywhere, it degrades instead of dying, state survives restarts, and the person on
+call at 3am can answer "why was this answer wrong?" from a trace.
+
+### Reproducible artefact
+- `Dockerfile`: multi-stage, `uv sync --frozen` from the lockfile (dependency layer
+  cached separately), non-root user, no dev tooling or tests in the image, `HEALTHCHECK`,
+  graceful shutdown (30s for in-flight SSE streams), build arg `GIT_SHA` -> `/version`.
+- `docker-compose.yml`: db + api; `make up`. The prod image defaults `DOCSPILOT_ENV=prod`,
+  which **refuses to start** without keys, database, real embedder, auth, rate limits and
+  budgets (Phase 6 validators): misconfiguration fails the deploy, not the first customer.
+- CI (`ci.yml`): lint, types, tests *against pgvector*, the deterministic retrieval gate,
+  then a **container smoke test** (build the image, boot the stack with the fake model,
+  hit `/readyz`, stream a chat, check headers/metrics). `evals.yml` is the opt-in live
+  quality gate. A non-blocking dependency audit runs alongside.
+
+### Resilience, in layers (`llm/resilient.py`, `degraded.py`)
+1. SDK retries with backoff (Phase 1).
+2. **Failover** to a secondary model on retryable errors, for the answer path only
+   (triage/judge/route are cheap and fail open on their own). If the failed model had
+   already streamed text, a `StreamReset` tells the client to discard it.
+3. **Circuit breaker** per model: after N consecutive failures stop calling the dead
+   dependency (every user otherwise waits out the full timeout), probe once after a
+   cool-down. Instrumentation sits *inside* failover, so each attempt has its own span
+   and cost.
+4. **Degraded mode**: if no model can answer, return the most relevant doc excerpts
+   (labelled, cited, guarded, not cached). Free, instant, cannot hallucinate. Only when
+   nothing has been shown yet, so an answer is never replaced mid-sentence.
+5. The honest error event, with a retryable flag, when even that is impossible.
+
+`/readyz` reports breaker state but does not go unready for it: failover and degraded
+mode are exactly the situations where you still want traffic.
+
+### State that survives deploys
+Pending human confirmations moved from process memory to Postgres
+(`agent/pending_pg.py`): an approval can land on a different replica than the one that
+proposed the action, and a rollout does not strand users mid-flow. The claim is one
+conditional `UPDATE`, so two replicas racing cannot both execute. SDK content blocks
+(including thinking blocks) are stored as JSON and replayed as plain dicts.
+Still per replica *by design*: response cache, rate limiter, breakers; each is an
+optimisation or a guard rail whose failure mode is "slightly less effective", not wrong.
+
+### Operability
+`docs/RUNBOOK.md`: first five minutes, debugging a bad answer from a trace, provider
+outage, cost spike, re-ingest, key rotation, deploy/rollback, known limits.
+`docs/ARCHITECTURE.md`: request flow and a table of "what happens when X is down".
+`scripts/smoke.py` (stdlib only) and `scripts/loadtest.py` (concurrency, p50/p95, checks
+no in-flight leak) work against any environment; run them against the fake backend to
+test the service itself without spending credits.
+
+### Subtle failure modes found in review
+- **A half-open breaker must never leak its probe slot.** The probe can end without a
+  verdict (client cancelled, a 400, an exception). Without `abort_probe()` in a `finally`
+  the breaker stays half-open forever and a model is disabled until restart. Cancellation
+  and bad requests are not evidence about the *provider*, so they are not failures either.
+- **A failover answer is a different product.** It is marked `served_by_fallback`, never
+  stored in the shared cache (the key is built for the primary), and a not-found model id
+  (retired) fails over while a 400 does not.
+- **Reset everything you buffered when a stream is discarded**: the output guard's held
+  tail, and the "has the user seen anything?" counter that decides whether degraded mode is
+  still allowed. A partial word glued onto the next answer is a real bug class.
+- **Degraded and failed requests cost nothing**: the budget reservation is refunded; only
+  a *disconnect* keeps it. Otherwise the guard rail locks users out exactly when the
+  outage ends.
+- **Bookkeeping in `finally` must be shielded.** On disconnect that block runs inside a
+  cancelled scope; an un-shielded `await release()` is silently skipped and strands the
+  entry. Outcomes are checkpointed immediately after each side effect, and a retry skips
+  calls that already have a recorded outcome.
+- **Use the database clock for TTLs** that several replicas must agree on.
+- `stop_grace_period` must exceed the app's drain time, or Docker SIGKILLs it first.
+
+### What breaks in production
+| Symptom | Cause | Where to look |
+|---|---|---|
+| Container restarts at boot | strict config validation (missing key/db/limits) | container logs: the validator message names the setting |
+| Approval returns 404 after deploy | pending store was in-memory (fixed) / TTL expired | `pending_actions`, `confirmation_ttl_s` |
+| Everything slow during a provider incident | no breaker / timeouts too high | `breakers` in `/readyz`, `llm_failover` logs |
+| Users see doc excerpts instead of answers | degraded mode active | `docspilot_degraded_answers_total`, provider status |
+| Streams cut at deploy | shutdown grace shorter than stream duration | `--timeout-graceful-shutdown`, orchestrator grace period |

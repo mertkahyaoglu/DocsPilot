@@ -29,8 +29,9 @@ from docspilot.api.schemas import ChatRequest
 from docspilot.budget import Budget, CostMeter, current_meter
 from docspilot.cache import CachedAnswer, CorpusVersionProvider, ResponseCache, cache_key
 from docspilot.config import Settings
+from docspilot.degraded import degraded_answer
 from docspilot.llm.errors import LLMError
-from docspilot.llm.types import LLM, StreamReset, TextDelta
+from docspilot.llm.types import LLM, StreamReset, TextDelta, Usage
 from docspilot.logging import get_logger
 from docspilot.pricing import cost_usd
 from docspilot.prompts import PromptRegistry
@@ -81,6 +82,7 @@ class CacheSlot:
     must never populate the shared cache (e.g. small-model routed replies)."""
 
     key: str
+    model: str = ""  # the model the key was built for: answers from any other are not stored
     allowed: bool = True
 
 
@@ -118,6 +120,7 @@ async def _to_sse(
     allowed_hosts: tuple[str, ...] | None = None,
     settle: Callable[[str], Awaitable[None]] | None = None,
     drop_pending: Callable[[str], Awaitable[None]] | None = None,
+    degrade: Callable[[], Awaitable[tuple[str, list[dict[str, str]]] | None]] | None = None,
 ) -> AsyncIterator[dict[str, str]]:
     """Translate agent events to SSE. Always ends the stream with done|error.
 
@@ -134,6 +137,8 @@ async def _to_sse(
     tools: set[str] = set()
     search_ok = 0
     search_failed = 0
+    sent_chars = 0
+    step_start_sent = 0  # chars shown before the current model step began
     guard = StreamingGuard(allowed_hosts) if allowed_hosts else None
     root = tel.start("chat.request", **{"docspilot.request_id": request_id})
     m.in_flight.inc()
@@ -153,13 +158,20 @@ async def _to_sse(
                 text += event.text
                 out = guard.feed(event.text) if guard else event.text
                 if out:
+                    sent_chars += len(out)
                     yield _sse("delta", {"text": out})
             elif isinstance(event, StreamReset):
+                # The current step's text is being discarded (failover): so is the guard's
+                # held tail, and the user has seen nothing of this step.
+                text = ""
+                sent_chars = step_start_sent
+                guard = StreamingGuard(allowed_hosts) if allowed_hosts else None
                 yield _sse("reset", {})
             elif isinstance(event, ToolStart):
                 tools.add(event.name)
                 yield _sse("tool_start", {"id": event.id, "name": event.name})
             elif isinstance(event, ToolEnd):
+                step_start_sent = sent_chars
                 if event.name == "search_docs":
                     search_failed += event.is_error
                     search_ok += not event.is_error
@@ -175,6 +187,7 @@ async def _to_sse(
             elif isinstance(event, NeedsConfirmation):
                 tail = flush_tail()
                 if tail:
+                    sent_chars += len(tail)
                     yield _sse("delta", {"text": tail})
                 # What the user is asked to approve is model-authored too: same checks.
                 args_text = "\n".join(s for i in event.items for s in _strings(i.arguments))
@@ -232,6 +245,7 @@ async def _to_sse(
                 )
                 tail = flush_tail()
                 if tail:
+                    sent_chars += len(tail)
                     yield _sse("delta", {"text": tail})
                 if guard and guard.blocked:
                     outcome = "output_blocked"
@@ -276,6 +290,7 @@ async def _to_sse(
                         and search_failed == 0
                         and not event.flags
                         and not event.served_by_fallback
+                        and event.model == slot.model  # never store a failover answer
                     )
                     if cacheable:
                         assert cache is not None and slot is not None
@@ -309,9 +324,39 @@ async def _to_sse(
             detail=str(exc),
         )
         root.record_exception(exc)
-        yield _sse(
-            "error", {"code": exc.kind, "retryable": exc.retryable, "message": exc.public_message}
-        )
+        fallback = None
+        if degrade is not None and exc.retryable and sent_chars == 0:
+            # Generation is down but nothing has been shown yet: answer from retrieval.
+            try:
+                fallback = await degrade()
+            except Exception:
+                log.exception("degraded_mode_failed")
+        if fallback is not None and (
+            not allowed_hosts or check_output(fallback[0], allowed_hosts).ok
+        ):
+            text_out, cites = fallback
+            outcome = "degraded"
+            m.degraded.inc()
+            log.warning("degraded_answer", cause=exc.kind, sources=len(cites))
+            yield _sse("delta", {"text": text_out})
+            yield _sse("citations", {"sources": cites})
+            yield _sse(
+                "done",
+                {
+                    "stop_reason": "degraded",
+                    "usage": asdict(Usage()),
+                    "model": None,
+                    "steps": 0,
+                    "request_id": request_id,
+                    "cached": False,
+                    "degraded": True,
+                },
+            )
+        else:
+            yield _sse(
+                "error",
+                {"code": exc.kind, "retryable": exc.retryable, "message": exc.public_message},
+            )
     except (GeneratorExit, asyncio.CancelledError):
         outcome = "cancelled"  # client disconnected: not an error
         raise
@@ -366,7 +411,7 @@ async def chat(
         tel.metrics.cache.labels("hit" if hit else "miss").inc()
         if hit is not None:
             return EventSourceResponse(_replay(hit, request_id, tel))
-        slot = CacheSlot(key)
+        slot = CacheSlot(key, model=settings.model_answer)
 
     reserved = await enforce_budget(request, user_id)
     try:
@@ -379,7 +424,9 @@ async def chat(
                 user_id,
                 reserved,
                 meter.usd,
-                refund=outcome.startswith("error") and meter.usd == 0,
+                # Nothing was consumed (error, degraded, blocked before the model): give the
+                # reservation back. A disconnect keeps it: the provider may still bill.
+                refund=outcome != "cancelled" and meter.usd == 0,
             )
 
         history = [m.model_dump() for m in body.messages]
@@ -389,6 +436,13 @@ async def chat(
         else:
             events = agent.run(history, ToolContext(user_id=user_id, tickets=tickets))
         hosts = settings.allowed_host_list if settings.output_guard else None
+        degrade = None
+        if settings.degraded_mode and first_turn:
+            retriever = request.app.state.rag.retriever
+
+            async def degrade() -> tuple[str, list[dict[str, str]]] | None:
+                return await degraded_answer(retriever, question, settings.injection_policy)
+
         return EventSourceResponse(
             _to_sse(
                 events,
@@ -399,6 +453,7 @@ async def chat(
                 allowed_hosts=hosts,
                 settle=settle,
                 drop_pending=request.app.state.pending.delete,
+                degrade=degrade,
             )
         )
     except BaseException:
@@ -505,7 +560,7 @@ async def confirm(
 
     async def settle(outcome: str) -> None:
         await budget.settle(
-            user_id, reserved, meter.usd, refund=outcome.startswith("error") and meter.usd == 0
+            user_id, reserved, meter.usd, refund=outcome != "cancelled" and meter.usd == 0
         )
 
     log.info("confirmation", approve=body.approve, tools=[c.name for c in pending.calls])

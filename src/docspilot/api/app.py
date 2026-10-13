@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import secrets
 from collections.abc import AsyncIterator
 from contextlib import AsyncExitStack, asynccontextmanager
@@ -13,7 +14,8 @@ from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 
 from docspilot import __version__
 from docspilot.agent.factory import build_agent
-from docspilot.agent.pending import InMemoryPendingStore
+from docspilot.agent.pending import InMemoryPendingStore, PendingStore
+from docspilot.agent.pending_pg import PostgresPendingStore
 from docspilot.api.chat import router as chat_router
 from docspilot.api.debug import router as debug_router
 from docspilot.api.feedback import router as feedback_router
@@ -30,6 +32,7 @@ from docspilot.config import Settings, get_settings
 from docspilot.llm.client import AnthropicLLM, build_anthropic_client
 from docspilot.llm.fake import FakeLLM, Script
 from docspilot.llm.instrumented import InstrumentedLLM
+from docspilot.llm.resilient import ResilientLLM
 from docspilot.llm.types import LLM
 from docspilot.logging import configure_logging, get_logger
 from docspilot.prompts import PromptRegistry
@@ -76,8 +79,16 @@ def create_app(
                 base_llm = AnthropicLLM(client, refusal_fallback=settings.refusal_fallback)
             else:
                 base_llm = llm
-            # Every model call (agent, triage, routing, ...) goes through this wrapper.
-            app.state.llm = InstrumentedLLM(base_llm, telemetry)
+            # Every model call goes through: failover/breaker -> instrumentation -> client.
+            # Instrumentation sits *inside* failover so each attempt gets its own span,
+            # metrics and cost.
+            app.state.llm = ResilientLLM(
+                InstrumentedLLM(base_llm, telemetry),
+                fallback_model=settings.model_fallback,
+                metrics=telemetry.metrics,
+                threshold=settings.breaker_threshold,
+                recovery_s=settings.breaker_recovery_s,
+            )
             app.state.answer_prompt = answer_prompt
 
             rag = await stack.enter_async_context(build_rag(settings))
@@ -103,7 +114,12 @@ def create_app(
                     env=settings.env,
                 )
             app.state.feedback = rag.feedback
-            app.state.pending = InMemoryPendingStore(ttl_s=settings.confirmation_ttl_s)
+            pending_store: PendingStore = (
+                PostgresPendingStore(rag.pool, ttl_s=settings.confirmation_ttl_s)
+                if rag.pool
+                else InMemoryPendingStore(ttl_s=settings.confirmation_ttl_s)
+            )
+            app.state.pending = pending_store
             rag.retriever.attach_telemetry(telemetry)
             app.state.agent = build_agent(
                 settings,
@@ -185,7 +201,19 @@ def create_app(
             return JSONResponse(
                 {"status": "embedding_model_mismatch", "documents": len(stale)}, status_code=503
             )
-        return JSONResponse({"status": "ready", "chunks": chunks})
+        return JSONResponse(
+            {
+                "status": "ready",
+                "chunks": chunks,
+                # informational: an open breaker means failover/degraded mode is active,
+                # which is exactly when we still want traffic (not a reason to go unready)
+                "breakers": app.state.llm.states() if hasattr(app.state.llm, "states") else {},
+            }
+        )
+
+    @app.get("/version", include_in_schema=False)
+    async def version() -> dict[str, str]:
+        return {"version": __version__, "git_sha": os.environ.get("GIT_SHA", "unknown")}
 
     if settings.web_dir.is_dir():
         app.mount("/", StaticFiles(directory=settings.web_dir, html=True), name="web")

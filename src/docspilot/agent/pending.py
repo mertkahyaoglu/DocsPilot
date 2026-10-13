@@ -52,6 +52,10 @@ class PendingStore(Protocol):
         raises PendingBusyError if another request holds it."""
         ...
 
+    async def checkpoint(self, pending: PendingAction) -> None:
+        """Persist progress (resolved outcomes) while keeping the claim."""
+        ...
+
     async def release(self, pending: PendingAction) -> None:
         """Give the claim back (keeps the entry, e.g. after a failed follow-up call)."""
         ...
@@ -97,6 +101,9 @@ class InMemoryPendingStore:
             raise PendingBusyError(pending_id)
         item.claimed_until = now + CLAIM_TIMEOUT_S
         return item
+
+    async def checkpoint(self, pending: PendingAction) -> None:
+        return None  # the object *is* the stored state
 
     async def release(self, pending: PendingAction) -> None:
         pending.claimed_until = 0.0

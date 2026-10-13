@@ -24,6 +24,8 @@ def settings() -> Settings:
         database_url=None,  # never touch a developer's database from unit tests
         embedder="hash",
         rerank="none",
+        # older tests assert the error path; degraded mode has its own tests
+        degraded_mode=False,
         _env_file=None,  # type: ignore[call-arg]
     )
 

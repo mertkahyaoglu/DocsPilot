@@ -35,3 +35,30 @@ jobs:
       - run: uv run pytest
       # Deterministic retrieval regression gate (hash embedder, no keys, no network).
       - run: uv run python -m docspilot.evals retrieval --offline --check-baseline evals/baselines/retrieval-offline.json
+
+  docker:
+    runs-on: ubuntu-latest
+    needs: check
+    steps:
+      - uses: actions/checkout@v4
+      - name: "build and start the stack (fake model, no secrets needed)"
+        env:
+          DOCSPILOT_LLM_BACKEND: fake
+          GIT_SHA: ${{ github.sha }}
+        run: docker compose up -d --build --wait db api
+      - name: smoke test
+        run: python3 scripts/smoke.py http://127.0.0.1:8000
+      - name: logs on failure
+        if: failure()
+        run: docker compose logs --no-color api db | tail -200
+      - run: docker compose down -v
+
+  audit:
+    runs-on: ubuntu-latest
+    continue-on-error: true   # advisory: transitive advisories should not block unrelated PRs
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      # audit the *locked runtime* dependency set, not the dev environment
+      - run: uv export --frozen --no-dev --no-emit-project --no-hashes -o requirements.txt
+      - run: uvx pip-audit -r requirements.txt --no-deps --disable-pip --progress-spinner off
