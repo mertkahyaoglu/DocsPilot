@@ -37,6 +37,8 @@ services:
     ports:
       - "127.0.0.1:8000:8000"
     restart: unless-stopped
+    # uvicorn drains for 30s (--timeout-graceful-shutdown); Docker's default would SIGKILL at 10s
+    stop_grace_period: 40s
 
 volumes:
   dbdata:

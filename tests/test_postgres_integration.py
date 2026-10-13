@@ -6,6 +6,7 @@ from __future__ import annotations
 import os
 import uuid
 from collections.abc import AsyncIterator
+from contextlib import aclosing
 from pathlib import Path
 
 import psycopg
@@ -241,3 +242,96 @@ async def test_pending_store_shared_between_replicas_and_survives_restart(dsn: s
     finally:
         await pool_a.close()
         await pool_b.close()
+
+
+async def test_pending_release_and_outcome_survive_cancellation_and_use_the_db_clock(
+    dsn: str,
+) -> None:
+    import asyncio
+    import time
+
+    from docspilot.agent.loop import Agent, AgentConfig, NeedsConfirmation
+    from docspilot.agent.pending_pg import PostgresPendingStore
+    from docspilot.agent.tools import ToolContext, ToolRegistry, default_tools
+    from docspilot.llm.fake import FakeLLM, Script
+    from docspilot.llm.types import ToolCall
+    from docspilot.tickets import InMemoryTicketStore
+
+    pool = await create_pool(dsn)
+    try:
+        store = PostgresPendingStore(pool, ttl_s=120)
+        args = {
+            "title": "Stuck payout",
+            "description": "In transit for 6 days.",
+            "severity": "high",
+        }
+        agent = Agent(
+            FakeLLM(
+                [Script(tool_calls=[ToolCall("w", "create_ticket", args)]), Script(text="done")]
+            ),
+            ToolRegistry(default_tools()),
+            store,
+            AgentConfig(model="m", system="s"),
+            confirmation_ttl_s=120,
+        )
+        tickets = InMemoryTicketStore()
+        ctx = ToolContext("alice", tickets)
+        events = [e async for e in agent.run([{"role": "user", "content": "ticket"}], ctx)]
+        needs = events[-1]
+        assert isinstance(needs, NeedsConfirmation)
+
+        async with pool.connection() as conn:
+            cur = await conn.execute(
+                "SELECT expires_at - extract(epoch from now()) FROM pending_actions WHERE id = %s",
+                (needs.pending_id,),
+            )
+            remaining = float((await cur.fetchone())[0])  # type: ignore[index]
+        assert 100 < remaining <= 120  # DB clock + ttl, whatever the app clock says
+
+        claimed = await store.claim(needs.pending_id, user_id="alice")
+        assert claimed is not None
+
+        executed = asyncio.Event()
+
+        async def consume() -> None:
+            # like the SSE wrapper: the generator is closed deterministically on teardown
+            async with aclosing(agent.resume(claimed, approve=True, ctx=ctx)) as stream:
+                async for event in stream:
+                    if type(event).__name__ == "ToolEnd":
+                        executed.set()
+                        await asyncio.sleep(30)  # the client stalls, then goes away
+
+        task = asyncio.create_task(consume())
+        await asyncio.wait_for(executed.wait(), timeout=5)  # the write has happened
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        await asyncio.sleep(0.3)  # shielded bookkeeping finishes in the background
+
+        async with pool.connection() as conn:
+            cur = await conn.execute(
+                "SELECT claimed_until, payload->'completed'->'w' IS NOT NULL "
+                "FROM pending_actions WHERE id = %s",
+                (needs.pending_id,),
+            )
+            row = await cur.fetchone()
+        assert row is not None
+        claimed_until, outcome_saved = row
+        assert claimed_until == 0 and outcome_saved  # released, and the write's outcome kept
+        assert len(tickets._by_id) == 1
+
+        # the retry replays the stored outcome to the model: no second execution
+        again = await store.claim(needs.pending_id, user_id="alice")
+        assert again is not None
+        retry_agent = Agent(
+            FakeLLM([Script(text="Your ticket is open.")]),
+            ToolRegistry(default_tools()),
+            store,
+            AgentConfig(model="m", system="s"),
+        )
+        out = [e async for e in retry_agent.resume(again, approve=True, ctx=ctx)]
+        assert not any(type(e).__name__ == "ToolStart" for e in out)
+        assert type(out[-1]).__name__ == "AgentFinished" and len(tickets._by_id) == 1
+        assert time.time() > 0
+    finally:
+        await pool.close()

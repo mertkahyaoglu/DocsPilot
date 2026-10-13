@@ -593,6 +593,27 @@ outage, cost spike, re-ingest, key rotation, deploy/rollback, known limits.
 no in-flight leak) work against any environment; run them against the fake backend to
 test the service itself without spending credits.
 
+### Subtle failure modes found in review
+- **A half-open breaker must never leak its probe slot.** The probe can end without a
+  verdict (client cancelled, a 400, an exception). Without `abort_probe()` in a `finally`
+  the breaker stays half-open forever and a model is disabled until restart. Cancellation
+  and bad requests are not evidence about the *provider*, so they are not failures either.
+- **A failover answer is a different product.** It is marked `served_by_fallback`, never
+  stored in the shared cache (the key is built for the primary), and a not-found model id
+  (retired) fails over while a 400 does not.
+- **Reset everything you buffered when a stream is discarded**: the output guard's held
+  tail, and the "has the user seen anything?" counter that decides whether degraded mode is
+  still allowed. A partial word glued onto the next answer is a real bug class.
+- **Degraded and failed requests cost nothing**: the budget reservation is refunded; only
+  a *disconnect* keeps it. Otherwise the guard rail locks users out exactly when the
+  outage ends.
+- **Bookkeeping in `finally` must be shielded.** On disconnect that block runs inside a
+  cancelled scope; an un-shielded `await release()` is silently skipped and strands the
+  entry. Outcomes are checkpointed immediately after each side effect, and a retry skips
+  calls that already have a recorded outcome.
+- **Use the database clock for TTLs** that several replicas must agree on.
+- `stop_grace_period` must exceed the app's drain time, or Docker SIGKILLs it first.
+
 ### What breaks in production
 | Symptom | Cause | Where to look |
 |---|---|---|

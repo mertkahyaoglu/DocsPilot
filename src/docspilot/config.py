@@ -151,14 +151,14 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def _require_key_in_prod(self) -> Settings:
-        if self.env == "prod" and self.anthropic_api_key is None:
-            raise ValueError("ANTHROPIC_API_KEY is required when DOCSPILOT_ENV=prod")
-        if self.env == "prod" and self.llm_backend != "anthropic":
-            raise ValueError("DOCSPILOT_LLM_BACKEND must be 'anthropic' in prod")
-        if self.env == "prod" and self.database_url is None:
-            raise ValueError("DATABASE_URL is required when DOCSPILOT_ENV=prod")
-        if self.env == "prod" and self.resolved_embedder == "hash":
-            raise ValueError("a real embedder (VOYAGE_API_KEY) is required in prod")
+        if self.strict and self.anthropic_api_key is None:
+            raise ValueError("ANTHROPIC_API_KEY is required outside dev/test")
+        if self.strict and self.llm_backend != "anthropic":
+            raise ValueError("DOCSPILOT_LLM_BACKEND must be 'anthropic' outside dev/test")
+        if self.strict and self.database_url is None:
+            raise ValueError("DATABASE_URL is required outside dev/test")
+        if self.strict and self.resolved_embedder == "hash":
+            raise ValueError("a real embedder (VOYAGE_API_KEY) is required outside dev/test")
         if self.strict:
             if self.api_keys is None:
                 raise ValueError("DOCSPILOT_API_KEYS is required outside dev/test")

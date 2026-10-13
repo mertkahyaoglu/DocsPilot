@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import dataclasses
 import secrets
+import time
 from typing import Any
 
 from psycopg.types.json import Jsonb
@@ -82,10 +83,13 @@ class PostgresPendingStore:
             await conn.execute(
                 f"DELETE FROM pending_actions WHERE expires_at < {_NOW}"  # noqa: S608
             )
+            # TTL is applied on the database clock: replicas with skewed clocks must
+            # not shift when a confirmation expires.
+            ttl = max(pending.expires_at - time.time(), 0.0)
             await conn.execute(
                 "INSERT INTO pending_actions (id, user_id, payload, expires_at) "
-                "VALUES (%s, %s, %s, %s)",
-                (pending.id, pending.user_id, Jsonb(encode(pending)), pending.expires_at),
+                "VALUES (%s, %s, %s, extract(epoch from now()) + %s)",
+                (pending.id, pending.user_id, Jsonb(encode(pending)), ttl),
             )
             # per-user cap: keep the newest N (a noisy caller evicts only itself)
             await conn.execute(
@@ -114,6 +118,13 @@ class PostgresPendingStore:
             if await cur.fetchone() is not None:
                 raise PendingBusyError(pending_id)  # exists, owned, live: someone holds it
             return None
+
+    async def checkpoint(self, pending: PendingAction) -> None:
+        async with self._pool.connection() as conn:
+            await conn.execute(
+                "UPDATE pending_actions SET payload = %s WHERE id = %s",
+                (Jsonb(encode(pending)), pending.id),
+            )
 
     async def release(self, pending: PendingAction) -> None:
         async with self._pool.connection() as conn:

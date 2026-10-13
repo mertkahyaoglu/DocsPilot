@@ -10,7 +10,7 @@ from __future__ import annotations
 import asyncio
 import re
 import time
-from collections.abc import AsyncGenerator
+from collections.abc import AsyncGenerator, Awaitable
 from contextlib import aclosing
 from dataclasses import dataclass
 from typing import Any
@@ -124,6 +124,20 @@ class AgentConfig:
     prompt_sha: str = ""
 
 
+_BACKGROUND: set[asyncio.Future[None]] = set()
+
+
+async def _shielded(awaitable: Awaitable[None]) -> None:
+    """Run bookkeeping to completion even if the calling task is being cancelled."""
+    task = asyncio.ensure_future(awaitable)
+    _BACKGROUND.add(task)
+    task.add_done_callback(_BACKGROUND.discard)
+    try:
+        await asyncio.shield(task)
+    except asyncio.CancelledError:
+        pass  # the task keeps running; we are being torn down anyway
+
+
 def _tool_result_block(call_id: str, outcome: ToolOutcome) -> dict[str, Any]:
     block: dict[str, Any] = {
         "type": "tool_result",
@@ -165,37 +179,45 @@ class Agent:
 
         `pending` must be claimed by the caller. Safe to call again on the same entry
         after a failure: already-resolved calls are replayed, never re-executed."""
-        if pending.awaiting:
-            waiting = [c for c in pending.calls if c.id in pending.awaiting]
-            for call in waiting:
-                if not approve:
-                    pending.completed[call.id] = ToolOutcome(DECLINED)
-                    continue
-                parsed = self._registry.parse(call.name, call.input)
-                if isinstance(parsed, ToolOutcome):
-                    pending.completed[call.id] = parsed
-                    continue
-                tool, args = parsed
-                yield ToolStart(call.id, call.name, call.input)
-                started = time.perf_counter()
-                # Same key on every retry of this confirmation => at-most-once side effect
-                # even if we crashed after executing but before recording the outcome.
-                keyed = ctx.with_key(f"{pending.id}:{call.id}")
-                outcome = await self._registry.execute(
-                    tool, args, keyed, timeout_s=self._config.tool_timeout_s
-                )
-                pending.completed[call.id] = outcome
-                yield ToolEnd(
-                    call.id,
-                    call.name,
-                    outcome.is_error,
-                    round((time.perf_counter() - started) * 1000, 1),
-                )
-            pending.awaiting = []  # resolved: a retry replays instead of re-executing
-
-        messages = [*pending.messages, self._results_message(pending.calls, pending.completed)]
         finished = False
         try:
+            if pending.awaiting:
+                # Skip calls whose outcome was already recorded (a retry after a partial
+                # run): they are replayed to the model, never executed twice.
+                waiting = [
+                    c
+                    for c in pending.calls
+                    if c.id in pending.awaiting and c.id not in pending.completed
+                ]
+                for call in waiting:
+                    if not approve:
+                        pending.completed[call.id] = ToolOutcome(DECLINED)
+                        continue
+                    parsed = self._registry.parse(call.name, call.input)
+                    if isinstance(parsed, ToolOutcome):
+                        pending.completed[call.id] = parsed
+                        continue
+                    tool, args = parsed
+                    yield ToolStart(call.id, call.name, call.input)
+                    started = time.perf_counter()
+                    # Same key on every retry of this confirmation => at-most-once side
+                    # effect even if we crashed after executing but before recording.
+                    keyed = ctx.with_key(f"{pending.id}:{call.id}")
+                    outcome = await self._registry.execute(
+                        tool, args, keyed, timeout_s=self._config.tool_timeout_s
+                    )
+                    pending.completed[call.id] = outcome
+                    # Persist right away: a crash after the side effect must not forget it.
+                    await _shielded(self._pending.checkpoint(pending))
+                    yield ToolEnd(
+                        call.id,
+                        call.name,
+                        outcome.is_error,
+                        round((time.perf_counter() - started) * 1000, 1),
+                    )
+                pending.awaiting = []  # resolved: a retry replays instead of re-executing
+
+            messages = [*pending.messages, self._results_message(pending.calls, pending.completed)]
             # The pause already spent its step; always leave one for the model to answer.
             async with aclosing(
                 self._loop(
@@ -212,10 +234,12 @@ class Agent:
                         finished = True
                     yield event
         finally:
+            # Shielded: on disconnect this block runs inside a cancelled scope, and a
+            # lost release would strand the entry claimed (and its outcome unsaved).
             if finished:
-                await self._pending.delete(pending.id)
+                await _shielded(self._pending.delete(pending.id))
             else:  # failed or disconnected: keep the resolved entry so the client can retry
-                await self._pending.release(pending)
+                await _shielded(self._pending.release(pending))
 
     # -- internals ------------------------------------------------------------
 

@@ -59,5 +59,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v5
-      - run: uv sync --frozen
-      - run: uv run --with pip-audit pip-audit --strict --progress-spinner off
+      # audit the *locked runtime* dependency set, not the dev environment
+      - run: uv export --frozen --no-dev --no-emit-project --no-hashes -o requirements.txt
+      - run: uvx pip-audit -r requirements.txt --no-deps --disable-pip --progress-spinner off
