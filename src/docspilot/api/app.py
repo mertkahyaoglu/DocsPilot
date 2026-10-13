@@ -8,7 +8,7 @@ from fastapi.staticfiles import StaticFiles
 
 from docspilot import __version__
 from docspilot.api.chat import router as chat_router
-from docspilot.api.middleware import RequestContextMiddleware
+from docspilot.api.middleware import BodySizeLimitMiddleware, RequestContextMiddleware
 from docspilot.config import Settings, get_settings
 from docspilot.llm.client import AnthropicLLM, build_anthropic_client
 from docspilot.llm.fake import FakeLLM, Script
@@ -43,8 +43,17 @@ def create_app(settings: Settings | None = None, llm: LLM | None = None) -> Fast
         if client is not None:
             await client.close()
 
-    app = FastAPI(title="DocsPilot", version=__version__, lifespan=lifespan)
-    app.add_middleware(RequestContextMiddleware)
+    prod = settings.env == "prod"
+    app = FastAPI(
+        title="DocsPilot",
+        version=__version__,
+        lifespan=lifespan,
+        docs_url=None if prod else "/docs",
+        redoc_url=None,
+        openapi_url=None if prod else "/openapi.json",
+    )
+    app.add_middleware(BodySizeLimitMiddleware, max_bytes=settings.max_body_bytes)
+    app.add_middleware(RequestContextMiddleware)  # outermost: sees every response, incl. 413
     app.include_router(chat_router)
 
     @app.get("/healthz", include_in_schema=False)
@@ -53,4 +62,6 @@ def create_app(settings: Settings | None = None, llm: LLM | None = None) -> Fast
 
     if settings.web_dir.is_dir():
         app.mount("/", StaticFiles(directory=settings.web_dir, html=True), name="web")
+    else:
+        log.warning("web_dir_missing", path=str(settings.web_dir))
     return app

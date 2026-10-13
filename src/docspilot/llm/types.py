@@ -52,6 +52,11 @@ class TextDelta:
 
 
 @dataclass(frozen=True, slots=True)
+class StreamReset:
+    """The provider switched models mid-turn (refusal fallback). Discard text streamed so far."""
+
+
+@dataclass(frozen=True, slots=True)
 class LLMResult:
     text: str
     # Raw assistant content blocks. Replay these *unchanged* when continuing a tool loop:
@@ -69,12 +74,12 @@ class LLMResult:
         return self.stop_reason == "refusal"
 
 
-LLMEvent = TextDelta | LLMResult
+LLMEvent = TextDelta | StreamReset | LLMResult
 
 
 class LLM(Protocol):
     def stream(self, request: LLMRequest) -> AsyncIterator[LLMEvent]:
-        """Yield TextDelta events, then exactly one LLMResult."""
+        """Yield TextDelta (and rarely StreamReset) events, then exactly one LLMResult."""
         ...
 
 

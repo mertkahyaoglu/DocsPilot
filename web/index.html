@@ -69,7 +69,8 @@ async function* sse(response) {
   for (;;) {
     const { value, done } = await reader.read();
     if (done) return;
-    buf += value.replace(/\r\n/g, "\n");
+    // Normalise on the accumulated buffer: "\r\n" may be split across chunks.
+    buf = (buf + value).replace(/\r\n/g, "\n");
     let idx;
     while ((idx = buf.indexOf("\n\n")) >= 0) {
       const raw = buf.slice(0, idx); buf = buf.slice(idx + 2);
@@ -83,39 +84,60 @@ async function* sse(response) {
   }
 }
 
+function errorText(body, fallback) {
+  const d = body && body.detail;
+  if (typeof d === "string") return d;
+  if (Array.isArray(d)) return d.map((x) => x.msg).join("; ");
+  return fallback;
+}
+
+const MAX_TURNS = 20;           // keep in sync with DOCSPILOT_MAX_HISTORY_MESSAGES
+function windowed() {
+  let h = history.slice(-MAX_TURNS);
+  while (h.length && h[0].role !== "user") h = h.slice(1);   // must start with a user turn
+  return h;
+}
+
+let busy = false;
 form.addEventListener("submit", async (e) => {
   e.preventDefault();
   const text = input.value.trim();
-  if (!text) return;
-  input.value = ""; send.disabled = true;
+  if (!text || busy) return;
+  busy = true; input.value = ""; send.disabled = true;
   history.push({ role: "user", content: text });
   bubble("user", text);
   const out = bubble("assistant");
-  let answer = "";
+  let answer = "", ok = false;
   try {
     const res = await fetch("/v1/chat", {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ messages: history }),
+      body: JSON.stringify({ messages: windowed() }),
     });
-    if (!res.ok) throw new Error((await res.json()).detail ?? res.statusText);
+    if (!res.ok) {
+      const body = await res.json().catch(() => null);
+      throw new Error(errorText(body, res.statusText));
+    }
     for await (const { event, data } of sse(res)) {
       if (event === "delta") { answer += data.text; out.textContent = answer; }
-      else if (event === "error") { out.classList.add("error"); out.textContent = data.message; }
-      else if (event === "done") {
+      else if (event === "reset") { answer = ""; out.textContent = ""; }
+      else if (event === "error") {
+        answer = ""; out.classList.add("error"); out.textContent = data.message;
+      } else if (event === "done") {
+        ok = true;
         const m = document.createElement("div"); m.className = "meta";
         m.textContent = `${data.model} · ${data.usage.input_tokens} in / ${data.usage.output_tokens} out`;
         out.appendChild(m);
       }
       log.scrollTop = log.scrollHeight;
     }
-    if (answer) history.push({ role: "assistant", content: answer });
-    else history.pop();           // keep roles alternating after a failed turn
   } catch (err) {
     out.classList.add("error"); out.textContent = String(err.message ?? err);
-    history.pop();
   } finally {
-    send.disabled = false; input.focus();
+    // Only a completed turn becomes history; otherwise drop the user turn so roles alternate.
+    if (ok && answer) history.push({ role: "assistant", content: answer });
+    else history.pop();
+    busy = false; send.disabled = false; input.focus();
   }
 });
 input.addEventListener("keydown", (e) => {

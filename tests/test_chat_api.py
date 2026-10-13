@@ -94,3 +94,55 @@ async def test_chat_enforces_configured_limits(client: httpx.AsyncClient) -> Non
     long = "x" * 4001
     res = await client.post("/v1/chat", json={"messages": [{"role": "user", "content": long}]})
     assert res.status_code == 422
+
+
+async def test_assistant_history_has_looser_limit_than_user(
+    client: httpx.AsyncClient,
+) -> None:
+    long_answer = "a" * 6000  # > user limit (4000), < assistant limit (20000)
+    payload = {
+        "messages": [
+            {"role": "user", "content": "q1"},
+            {"role": "assistant", "content": long_answer},
+            {"role": "user", "content": "follow up"},
+        ]
+    }
+    res = await client.post("/v1/chat", json=payload)
+    assert res.status_code == 200
+
+
+async def test_unexpected_exception_still_yields_error_event(
+    app, client: httpx.AsyncClient
+) -> None:
+    class Boom:
+        async def stream(self, request):  # type: ignore[no-untyped-def]
+            raise TypeError("Could not resolve authentication method")
+            yield  # pragma: no cover
+
+    app.state.llm = Boom()
+    res = await client.post("/v1/chat", json={"messages": [{"role": "user", "content": "x"}]})
+    events = parse_sse(res.text)
+    assert events[-1][0] == "error"
+    assert events[-1][1]["code"] == "unknown"
+    assert "authentication" not in res.text
+
+
+async def test_reset_event_is_forwarded(app, client: httpx.AsyncClient) -> None:
+    from docspilot.llm.types import LLMResult, StreamReset, TextDelta, Usage
+
+    class Resetting:
+        async def stream(self, request):  # type: ignore[no-untyped-def]
+            yield TextDelta("refused part")
+            yield StreamReset()
+            yield TextDelta("rescue")
+            yield LLMResult("rescue", [], "end_turn", Usage(), "m", served_by_fallback=True)
+
+    app.state.llm = Resetting()
+    res = await client.post("/v1/chat", json={"messages": [{"role": "user", "content": "x"}]})
+    assert [e for e, _ in parse_sse(res.text)] == ["delta", "reset", "delta", "done"]
+
+
+async def test_oversized_body_is_rejected_before_parsing(client: httpx.AsyncClient) -> None:
+    big = '{"messages":[{"role":"user","content":"' + "x" * 300_000 + '"}]}'
+    res = await client.post("/v1/chat", content=big, headers={"content-type": "application/json"})
+    assert res.status_code == 413

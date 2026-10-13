@@ -6,10 +6,12 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Literal
 
-from pydantic import Field, SecretStr, model_validator
+from pydantic import Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 Effort = Literal["low", "medium", "high", "xhigh", "max"]
+# src/docspilot/config.py -> repo root. Absolute, so the CWD does not matter.
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
 # Models for which the server-side refusal fallback is supported (Claude API only).
 FALLBACK_CAPABLE_MODELS = frozenset(
@@ -25,7 +27,7 @@ class Settings(BaseSettings):
     )
 
     env: Literal["dev", "test", "prod"] = "dev"
-    log_level: str = "INFO"
+    log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR"] = "INFO"
     log_json: bool = False
 
     # The SDK also reads ANTHROPIC_API_KEY itself; we surface it for fail-fast validation.
@@ -45,12 +47,22 @@ class Settings(BaseSettings):
     llm_max_retries: int = Field(default=2, ge=0, le=6)
     refusal_fallback: bool = True
 
-    prompts_dir: Path = Path("prompts")
-    web_dir: Path = Path("web")
+    prompts_dir: Path = PROJECT_ROOT / "prompts"
+    web_dir: Path = PROJECT_ROOT / "web"
     answer_prompt_version: int | None = None  # None = latest
 
     max_history_messages: int = Field(default=20, ge=1)
-    max_message_chars: int = Field(default=4000, ge=1)
+    max_message_chars: int = Field(default=4000, ge=1)  # user messages
+    max_assistant_chars: int = Field(default=20_000, ge=1)  # prior answers echoed back
+    max_body_bytes: int = Field(default=256 * 1024, ge=1024)
+
+    @field_validator("anthropic_api_key", mode="before")
+    @classmethod
+    def _blank_key_is_none(cls, v: object) -> object:
+        # `.env.example` ships `ANTHROPIC_API_KEY=`: blank must not satisfy fail-fast.
+        if isinstance(v, str) and not v.strip():
+            return None
+        return v
 
     @model_validator(mode="after")
     def _require_key_in_prod(self) -> Settings:

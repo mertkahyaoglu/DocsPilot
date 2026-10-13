@@ -9,11 +9,11 @@ from pydantic import BaseModel, Field, model_validator
 class ChatMessage(BaseModel):
     role: Literal["user", "assistant"]
     # Hard upper bound; the configured (lower) limit is enforced in the route.
-    content: str = Field(min_length=1, max_length=20_000)
+    content: str = Field(min_length=1, max_length=32_000)
 
 
 class ChatRequest(BaseModel):
-    messages: list[ChatMessage] = Field(min_length=1, max_length=100)
+    messages: list[ChatMessage] = Field(min_length=1, max_length=50)
 
     @model_validator(mode="after")
     def _alternating_user_first_and_last(self) -> ChatRequest:

@@ -23,3 +23,10 @@ def test_prod_rejects_fake_backend(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test")
     with pytest.raises(ValidationError):
         Settings(env="prod", llm_backend="fake", _env_file=None)  # type: ignore[call-arg]
+
+
+def test_blank_key_counts_as_missing(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "   ")
+    with pytest.raises(ValidationError):
+        Settings(env="prod", _env_file=None)  # type: ignore[call-arg]
+    assert Settings(_env_file=None).anthropic_api_key is None  # type: ignore[call-arg]

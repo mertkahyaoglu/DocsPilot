@@ -10,7 +10,15 @@ import anthropic
 
 from docspilot.config import FALLBACK_CAPABLE_MODELS, Settings
 from docspilot.llm.errors import LLMError
-from docspilot.llm.types import LLMEvent, LLMRequest, LLMResult, TextDelta, ToolCall, Usage
+from docspilot.llm.types import (
+    LLMEvent,
+    LLMRequest,
+    LLMResult,
+    StreamReset,
+    TextDelta,
+    ToolCall,
+    Usage,
+)
 
 _FALLBACK_BETA = "server-side-fallback-2026-07-01"
 
@@ -41,12 +49,20 @@ class AnthropicLLM:
             else:
                 manager = self._client.messages.stream(**kwargs)
             async with manager as stream:
-                async for text in stream.text_stream:
-                    yield TextDelta(text)
+                async for event in stream:
+                    if event.type == "content_block_delta" and event.delta.type == "text_delta":
+                        yield TextDelta(event.delta.text)
+                    elif (
+                        event.type == "content_block_start"
+                        and event.content_block.type == "fallback"
+                    ):
+                        # Refused model's partial text must not be shown with the rescue's.
+                        yield StreamReset()
                 final = await stream.get_final_message()
+                request_id = stream.request_id
         except anthropic.APIError as exc:
             raise LLMError.from_anthropic(exc) from exc
-        yield _to_result(final)
+        yield _to_result(final, request_id)
 
     @staticmethod
     def _build_kwargs(request: LLMRequest) -> dict[str, Any]:
@@ -71,13 +87,19 @@ class AnthropicLLM:
         return kwargs
 
 
-def _to_result(message: Any) -> LLMResult:
+def _to_result(message: Any, request_id: str | None = None) -> LLMResult:
     blocks = list(message.content)
-    text = "".join(b.text for b in blocks if b.type == "text")
+    # Only the final model's text counts: drop everything before the last fallback marker.
+    last_fallback = max((i for i, b in enumerate(blocks) if b.type == "fallback"), default=-1)
+    text = "".join(b.text for b in blocks[last_fallback + 1 :] if b.type == "text")
+    u = message.usage
+    iterations = getattr(u, "iterations", None) or []
+    fell_back = last_fallback >= 0 or any(
+        getattr(it, "type", None) == "fallback_message" for it in iterations
+    )
     tool_calls = [
         ToolCall(id=b.id, name=b.name, input=dict(b.input)) for b in blocks if b.type == "tool_use"
     ]
-    u = message.usage
     usage = Usage(
         input_tokens=u.input_tokens or 0,
         output_tokens=u.output_tokens or 0,
@@ -91,6 +113,6 @@ def _to_result(message: Any) -> LLMResult:
         usage=usage,
         model=message.model,
         tool_calls=tool_calls,
-        request_id=getattr(message, "_request_id", None),
-        served_by_fallback=any(b.type == "fallback" for b in blocks),
+        request_id=request_id or getattr(message, "_request_id", None),
+        served_by_fallback=fell_back,
     )

@@ -36,6 +36,26 @@ _RETRYABLE: frozenset[ErrorKind] = frozenset(
 )
 
 
+_BODY_TYPES: dict[str, ErrorKind] = {
+    "overloaded_error": "overloaded",
+    "rate_limit_error": "rate_limited",
+    "api_error": "server",
+    "timeout_error": "timeout",
+    "authentication_error": "auth",
+    "permission_error": "auth",
+    "not_found_error": "not_found",
+    "invalid_request_error": "bad_request",
+}
+
+
+def _kind_from_body(body: object) -> ErrorKind:
+    if isinstance(body, dict):
+        error = body.get("error", body)
+        if isinstance(error, dict):
+            return _BODY_TYPES.get(str(error.get("type")), "unknown")
+    return "unknown"
+
+
 class LLMError(Exception):
     def __init__(
         self,
@@ -76,7 +96,11 @@ class LLMError(Exception):
         elif isinstance(exc, anthropic.APIConnectionError):
             kind = "connection"
         elif isinstance(exc, anthropic.APIStatusError):
-            if exc.status_code >= 500:
+            if exc.status_code < 400:
+                # Errors sent *inside* an SSE stream carry the 200 of the stream itself;
+                # the real classification is in the body.
+                kind = _kind_from_body(exc.body)
+            elif exc.status_code >= 500:
                 kind = "server"
             elif exc.status_code >= 400:
                 kind = "bad_request"
@@ -87,3 +111,7 @@ class LLMError(Exception):
         status = exc.status_code if isinstance(exc, anthropic.APIStatusError) else None
         request_id = getattr(exc, "request_id", None)
         return cls(str(exc), kind=kind, status_code=status, request_id=request_id)
+
+    @classmethod
+    def from_unexpected(cls, exc: BaseException) -> LLMError:
+        return cls(f"{type(exc).__name__}: {exc}", kind="unknown")
