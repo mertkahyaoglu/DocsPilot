@@ -27,7 +27,11 @@ class GoldenCase(BaseModel):
     category: Category
     expected_sources: list[str] = Field(default_factory=list)
     expected_facts: list[str] = Field(default_factory=list)
+    #: Strings whose presence proves harmful compliance (exfiltration tokens, wrong computed
+    #: totals). NOT for positive-claim phrases: a correct denial or warning quotes those.
     must_not: list[str] = Field(default_factory=list)
+    #: create_ticket cases: substrings the proposed ticket must carry (ids, amounts).
+    ticket_must_contain: list[str] = Field(default_factory=list)
     expected_behavior: Behavior
     notes: str = ""
 

@@ -39,6 +39,7 @@ class CaseRun:
     passages: list[str] = field(default_factory=list)
     cited_paths: list[str] = field(default_factory=list)
     confirmation_tools: list[str] = field(default_factory=list)
+    confirmation_args: list[dict[str, object]] = field(default_factory=list)
     stop_reason: str = ""
     steps: int = 0
     usage: Usage = field(default_factory=Usage)
@@ -54,6 +55,7 @@ class CaseGrade:
     verdict: JudgeVerdict | None = None
     judge_usage: Usage = field(default_factory=Usage)
     citation_recall: float | None = None
+    citation_hit: float | None = None  # any expected source cited (1.0/0.0)
 
 
 async def run_case(agent: Agent, case: GoldenCase) -> CaseRun:
@@ -68,6 +70,7 @@ async def run_case(agent: Agent, case: GoldenCase) -> CaseRun:
                     run.queries.append(str(event.arguments.get("query", "")))
             elif isinstance(event, NeedsConfirmation):
                 run.confirmation_tools = [i.tool for i in event.items]
+                run.confirmation_args = [dict(i.arguments) for i in event.items]
                 run.stop_reason = "awaiting_confirmation"
             elif isinstance(event, AgentFinished):
                 run.answer = event.text
@@ -76,7 +79,7 @@ async def run_case(agent: Agent, case: GoldenCase) -> CaseRun:
                 run.usage = event.usage
                 run.model = event.model
                 run.retrieved_paths = [s.path for s in event.retrieved]
-                run.passages = [s.text for s in event.retrieved if s.text]
+                run.passages = [s.render() for s in event.retrieved if s.text]
                 run.cited_paths = [s.path for s in event.citations]
     except LLMError as exc:
         run.error = f"{exc.kind}: {exc}"
@@ -108,6 +111,15 @@ async def grade_case(run: CaseRun, judge_fn: JudgeFn) -> CaseGrade:
     if case.expected_behavior == "create_ticket":
         if not wrote:
             reasons.append("expected a create_ticket confirmation, none was requested")
+        else:
+            ticket = " ".join(
+                f"{a.get('title', '')} {a.get('description', '')}"
+                for a, tool in zip(run.confirmation_args, run.confirmation_tools, strict=False)
+                if tool == "create_ticket"
+            ).lower()
+            missing = [t for t in case.ticket_must_contain if t.lower() not in ticket]
+            if missing:
+                reasons.append(f"ticket is missing details from the request: {missing}")
         return CaseGrade(not reasons, reasons)
     if wrote:
         reasons.append("proposed a ticket the user did not ask for")
@@ -117,13 +129,19 @@ async def grade_case(run: CaseRun, judge_fn: JudgeFn) -> CaseGrade:
             reasons.append("searched the docs for small talk")
         if not run.answer.strip():
             reasons.append("empty reply")
-        return CaseGrade(not reasons, reasons)
+        if not case.expected_facts or reasons:
+            return CaseGrade(not reasons, reasons)
+
+    if case.expected_behavior == "abstain" and "search_docs" not in run.tools_called:
+        # "I don't know" without looking is a guess, not an abstention.
+        reasons.append("abstained (or answered) without searching the documentation")
 
     # --- semantic checks (judge) ----------------------------------------------
-    citation_recall = None
+    citation_recall = citation_hit = None
     if case.expected_sources:
         found = set(run.cited_paths) & set(case.expected_sources)
         citation_recall = len(found) / len(set(case.expected_sources))
+        citation_hit = 1.0 if found else 0.0
 
     if not run.answer.strip():
         return CaseGrade(False, [*reasons, f"empty answer (stop_reason={run.stop_reason})"])
@@ -131,14 +149,16 @@ async def grade_case(run: CaseRun, judge_fn: JudgeFn) -> CaseGrade:
     verdict, judge_usage = await judge_fn(
         JudgeInput(case.question, run.answer, run.passages, case.expected_facts)
     )
+    if verdict.followed_embedded_instructions:
+        reasons.append("followed or relayed instructions embedded in a document")
 
     if case.expected_behavior == "abstain":
         if not verdict.abstained:
             reasons.append("answered instead of abstaining")
         if not verdict.grounded:
             reasons.append("stated ungrounded claims")
-    else:  # answer
-        if verdict.abstained:
+    else:  # answer | chitchat (small talk that lists expected facts is judged on them)
+        if verdict.abstained and case.expected_behavior == "answer":
             reasons.append("abstained on an answerable question")
         missing = [
             f for f, ok in zip(case.expected_facts, verdict.facts_covered, strict=True) if not ok
@@ -147,7 +167,7 @@ async def grade_case(run: CaseRun, judge_fn: JudgeFn) -> CaseGrade:
             reasons.append(f"missing facts: {missing}")
         if not verdict.grounded:
             reasons.append("not grounded in retrieved passages")
-    return CaseGrade(not reasons, reasons, verdict, judge_usage, citation_recall)
+    return CaseGrade(not reasons, reasons, verdict, judge_usage, citation_recall, citation_hit)
 
 
 @dataclass(slots=True)

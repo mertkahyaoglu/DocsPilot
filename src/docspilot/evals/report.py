@@ -14,13 +14,15 @@ from docspilot.pricing import cost_usd
 
 
 def summarize_answers(graded: list[GradedCase]) -> dict[str, Any]:
-    n = len(graded)
-    passed = sum(g.grade.passed for g in graded)
+    errored = [g for g in graded if g.run.error or _is_infra_failure(g)]
+    scored = [g for g in graded if g not in errored]  # infra failures are not model failures
+    n = len(scored)
+    passed = sum(g.grade.passed for g in scored)
     low, high = wilson_interval(passed, n)
     by_cat: dict[str, list[bool]] = defaultdict(list)
-    for g in graded:
+    for g in scored:
         by_cat[g.run.case.category].append(g.grade.passed)
-    cit = [g.grade.citation_recall for g in graded if g.grade.citation_recall is not None]
+    cit = [g.grade.citation_hit for g in scored if g.grade.citation_hit is not None]
     total_cost = 0.0
     unknown_cost = False
     for g in graded:
@@ -31,20 +33,27 @@ def summarize_answers(graded: list[GradedCase]) -> dict[str, Any]:
             total_cost += c
     return {
         "n": n,
+        "n_total": len(graded),
+        "error_rate": len(errored) / len(graded) if graded else 0.0,
         "pass_rate": passed / n if n else 0.0,
         "pass_rate_ci95": [round(low, 3), round(high, 3)],
         "by_category": {
             cat: {"n": len(v), "passed": sum(v), "rate": sum(v) / len(v)}
             for cat, v in sorted(by_cat.items())
         },
-        "citation_recall": mean(cit) if cit else None,
+        "citation_hit_rate": mean(cit) if cit else None,
         "latency_p50_s": round(percentile([g.run.latency_s for g in graded], 0.5), 2),
         "latency_p95_s": round(percentile([g.run.latency_s for g in graded], 0.95), 2),
         "mean_steps": round(mean([float(g.run.steps) for g in graded]), 2),
         "answer_cost_usd": None if unknown_cost else round(total_cost, 4),
         "tokens": asdict(sum((g.run.usage for g in graded), Usage())),
-        "errors": sum(1 for g in graded if g.run.error),
+        "errors": len(errored),
     }
+
+
+def _is_infra_failure(g: GradedCase) -> bool:
+    """Run crashes and judge failures say nothing about the model: report, don't score."""
+    return any(r.startswith(("run error", "judge failed")) for r in g.grade.reasons)
 
 
 def case_rows(graded: list[GradedCase]) -> list[dict[str, Any]]:
@@ -96,8 +105,9 @@ def render_retrieval(metrics: dict[str, RetrievalMetrics]) -> str:
 def render_answers(summary: dict[str, Any], graded: list[GradedCase]) -> str:
     lo, hi = summary["pass_rate_ci95"]
     out = [
-        f"pass rate  {summary['pass_rate']:.1%}  (95% CI {lo:.1%}-{hi:.1%}, n={summary['n']})",
-        f"citation recall {summary['citation_recall']}",
+        f"pass rate  {summary['pass_rate']:.1%}  (95% CI {lo:.1%}-{hi:.1%}, "
+        f"n={summary['n']} scored of {summary['n_total']})",
+        f"citation hit rate {summary['citation_hit_rate']}",
         f"latency p50/p95  {summary['latency_p50_s']}s / {summary['latency_p95_s']}s   "
         f"steps {summary['mean_steps']}   errors {summary['errors']}",
         f"answer cost  ${summary['answer_cost_usd']}   tokens {summary['tokens']}",
@@ -115,8 +125,11 @@ def render_answers(summary: dict[str, Any], graded: list[GradedCase]) -> str:
 
 
 def check_baseline(current: dict[str, dict[str, float]], baseline: dict[str, Any]) -> list[str]:
-    """current: {strategy: {metric: value}}. Returns human-readable regressions."""
-    tol = float(baseline.get("tolerance", 0.03))
+    """current: {strategy: {metric: value}}. Returns human-readable regressions.
+
+    Retrieval metrics are deterministic, so tolerance defaults to ~0: one lost case on
+    this dataset is a ~0.024 drop and must not slip through."""
+    tol = float(baseline.get("tolerance", 0.0))
     problems = []
     for strategy, metrics in baseline["metrics"].items():
         got = current.get(strategy)
@@ -127,24 +140,36 @@ def check_baseline(current: dict[str, dict[str, float]], baseline: dict[str, Any
             value = got.get(metric)
             if value is None:
                 problems.append(f"{strategy}.{metric} missing")
-            elif value < expected - tol:
-                problems.append(
-                    f"{strategy}.{metric}: {value:.3f} < baseline {expected:.3f} - {tol}"
-                )
+            elif value < expected - tol - 1e-9:
+                problems.append(f"{strategy}.{metric}: {value:.3f} < baseline {expected:.3f}")
     return problems
 
 
-def check_answers_baseline(summary: dict[str, Any], baseline: dict[str, Any]) -> list[str]:
-    tol = float(baseline.get("tolerance", 0.08))
+def check_answers_baseline(
+    summary: dict[str, Any], baseline: dict[str, Any], meta: dict[str, Any] | None = None
+) -> list[str]:
+    """Gate on the overall pass rate only. Per-category n is 3-5: one LLM flip moves a
+    category 20-33 points, so categories are reported, never gated."""
     problems = []
+    if meta is not None:
+        for key in ("judge_model", "embedder", "answer_model"):
+            have, want = meta.get(key), baseline.get("meta", {}).get(key)
+            if want is not None and have != want:
+                problems.append(f"baseline recorded with {key}={want!r}, this run used {have!r}")
+        n_base = baseline.get("meta", {}).get("n_cases")
+        if n_base is not None and meta.get("n_cases") != n_base:
+            problems.append(f"baseline covers {n_base} cases, this run {meta.get('n_cases')}")
+    if problems:
+        return problems  # incomparable runs: do not also report a bogus regression
+    if summary["error_rate"] > 0.1:
+        problems.append(
+            f"{summary['errors']} infra failures (run/judge errors): results unreliable"
+        )
+    tol = float(baseline.get("tolerance", 0.08))
     if summary["pass_rate"] < baseline["pass_rate"] - tol:
         problems.append(
             f"pass_rate {summary['pass_rate']:.3f} < baseline {baseline['pass_rate']:.3f} - {tol}"
         )
-    for cat, expected in baseline.get("by_category", {}).items():
-        got = summary["by_category"].get(cat)
-        if got is not None and got["rate"] < expected - max(tol, 0.15):  # small n per category
-            problems.append(f"{cat}: {got['rate']:.2f} < baseline {expected:.2f}")
     return problems
 
 

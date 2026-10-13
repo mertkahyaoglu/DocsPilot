@@ -41,8 +41,19 @@ def _settings(offline: bool) -> Settings:
 def _select(cases: list[GoldenCase], args: argparse.Namespace) -> list[GoldenCase]:
     if getattr(args, "category", None):
         cases = [c for c in cases if c.category in args.category]
-    if getattr(args, "limit", None):
-        cases = cases[: args.limit]
+    limit = getattr(args, "limit", None)
+    if limit:
+        # Round-robin across categories: the file is grouped, so "first N" would only
+        # ever test the easiest category.
+        by_cat: dict[str, list[GoldenCase]] = {}
+        for c in cases:
+            by_cat.setdefault(c.category, []).append(c)
+        picked: list[GoldenCase] = []
+        while len(picked) < limit and any(by_cat.values()):
+            for group in by_cat.values():
+                if group and len(picked) < limit:
+                    picked.append(group.pop(0))
+        cases = picked
     return cases
 
 
@@ -69,8 +80,8 @@ async def cmd_retrieval(args: argparse.Namespace) -> int:
             {
                 "suite": "retrieval",
                 "embedder": embedder,
-                "tolerance": 0.03,
-                "metrics": {"hybrid": current["hybrid"], "keyword": current["keyword"]},
+                "tolerance": 0.0,  # deterministic: any drop is a real change
+                "metrics": {name: current[name] for name in ("keyword", "hybrid", "hybrid@chunks")},
             },
         )
         print(f"baseline written to {args.write_baseline}")
@@ -103,6 +114,9 @@ async def cmd_answers(args: argparse.Namespace) -> int:
         settings = settings.model_copy(update={"model_judge": args.judge_model})
     if args.model:
         settings = settings.model_copy(update={"model_answer": args.model})
+    if (args.limit or args.category) and (args.check_baseline or args.write_baseline):
+        print("baselines need the full dataset: drop --limit/--category", file=sys.stderr)
+        return 2
     cases = _select(load_golden(args.golden, corpus_dir=settings.corpus_dir), args)
     registry = PromptRegistry(settings.prompts_dir)
     answer_prompt = registry.get("answer", args.answer_prompt_version)
@@ -171,7 +185,9 @@ async def cmd_answers(args: argparse.Namespace) -> int:
             },
         )
     if args.check_baseline:
-        problems = check_answers_baseline(summary, json.loads(args.check_baseline.read_text()))
+        problems = check_answers_baseline(
+            summary, json.loads(args.check_baseline.read_text()), meta
+        )
         for p in problems:
             print(f"REGRESSION {p}", file=sys.stderr)
         return 1 if problems else 0
@@ -179,7 +195,7 @@ async def cmd_answers(args: argparse.Namespace) -> int:
 
 
 async def cmd_calibrate(args: argparse.Namespace) -> int:
-    from docspilot.evals.judge import JudgeInput, judge
+    from docspilot.evals.judge import JudgeError, JudgeInput, judge
     from docspilot.llm.client import AnthropicLLM, build_anthropic_client
     from docspilot.prompts import PromptRegistry
 
@@ -189,21 +205,33 @@ async def cmd_calibrate(args: argparse.Namespace) -> int:
     client = build_anthropic_client(settings)
     llm = AnthropicLLM(client, refusal_fallback=settings.refusal_fallback)
     rows = [json.loads(line) for line in CALIBRATION.read_text().splitlines() if line.strip()]
-    agree = {"facts": 0, "abstained": 0, "grounded": 0}
-    disagreements = []
+    if not rows:
+        print("calibration set is empty", file=sys.stderr)
+        return 2
+    fields = ("facts", "abstained", "grounded", "followed_embedded_instructions")
+    agree = dict.fromkeys(fields, 0)
+    disagreements: list[tuple[str, list[str], str]] = []
     try:
         for row in rows:
-            verdict, _ = await judge(
-                llm,
-                JudgeInput(row["question"], row["answer"], row["passages"], row["expected_facts"]),
-                system=system,
-                model=model,
-            )
+            try:
+                verdict, _ = await judge(
+                    llm,
+                    JudgeInput(
+                        row["question"], row["answer"], row["passages"], row["expected_facts"]
+                    ),
+                    system=system,
+                    model=model,
+                )
+            except JudgeError as exc:
+                disagreements.append((row["id"], ["judge_error"], str(exc)))
+                continue
             human = row["human"]
             ok = {
                 "facts": verdict.facts_covered == human["facts_covered"],
                 "abstained": verdict.abstained == human["abstained"],
                 "grounded": verdict.grounded == human["grounded"],
+                "followed_embedded_instructions": verdict.followed_embedded_instructions
+                == human.get("followed_embedded_instructions", False),
             }
             for k, v in ok.items():
                 agree[k] += v
@@ -216,9 +244,9 @@ async def cmd_calibrate(args: argparse.Namespace) -> int:
     n = len(rows)
     print(f"judge={model} n={n}")
     for k, v in agree.items():
-        print(f"  {k:<10} agreement {v}/{n} = {v / n:.0%}")
-    for case_id, fields, why in disagreements:
-        print(f"  DISAGREE {case_id} on {fields}: {why[:200]}")
+        print(f"  {k:<32} agreement {v}/{n} = {v / n:.0%}")
+    for case_id, bad_fields, why in disagreements:
+        print(f"  DISAGREE {case_id} on {bad_fields}: {why[:200]}")
     return 0 if all(v / n >= 0.9 for v in agree.values()) else 1
 
 

@@ -41,6 +41,14 @@ class Source:
     title: str
     section: str
     text: str = ""  # passage shown to the model; used by evals, never sent to API clients
+    updated: str | None = None
+
+    def render(self) -> str:
+        """The passage as the model saw it (path, section, date, text): evals judge on this."""
+        head = f"[{self.path}] {self.section}"
+        if self.updated:
+            head += f" (updated {self.updated})"
+        return f"{head}\n{self.text}"
 
 
 @dataclass(frozen=True, slots=True)
@@ -259,7 +267,7 @@ class SearchDocsTool(Tool):
 
     def sources(self, output: dict[str, Any]) -> tuple[Source, ...]:
         return tuple(
-            Source(r["source"], r["title"], r["section"], r.get("text", ""))
+            Source(r["source"], r["title"], r["section"], r.get("text", ""), r.get("updated"))
             for r in output.get("results", [])
         )
 

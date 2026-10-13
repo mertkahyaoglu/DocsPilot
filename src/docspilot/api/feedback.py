@@ -4,7 +4,7 @@ import re
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, Request
-from pydantic import BaseModel, Field, StringConstraints
+from pydantic import BaseModel, Field, StringConstraints, field_validator
 
 from docspilot.api.deps import current_user_id
 from docspilot.feedback import Feedback, FeedbackStore, Rating
@@ -18,6 +18,11 @@ class FeedbackRequest(BaseModel):
     request_id: RequestId
     rating: Rating
     comment: Annotated[str, Field(max_length=500)] = ""
+
+    @field_validator("comment")
+    @classmethod
+    def _no_nul(cls, v: str) -> str:
+        return v.replace("\x00", "")  # Postgres text cannot hold NUL: would be a 500
 
 
 class FeedbackResponse(BaseModel):

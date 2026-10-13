@@ -32,3 +32,18 @@ async def test_feedback_validation(client: httpx.AsyncClient) -> None:
     ]
     for payload in bad:
         assert (await client.post("/v1/feedback", json=payload)).status_code == 422, payload
+
+
+async def test_feedback_is_one_vote_per_answer_and_strips_nul(
+    app,
+    client: httpx.AsyncClient,  # type: ignore[no-untyped-def]
+) -> None:
+    rid = "req-abcdef12"
+    await client.post("/v1/feedback", json={"request_id": rid, "rating": "up"})
+    res = await client.post(
+        "/v1/feedback", json={"request_id": rid, "rating": "down", "comment": "bad\u0000data"}
+    )
+    assert res.status_code == 201
+    items = app.state.feedback.items
+    assert len(items) == 1  # double votes replace, they do not stack
+    assert (items[0].rating, items[0].comment) == ("down", "baddata")

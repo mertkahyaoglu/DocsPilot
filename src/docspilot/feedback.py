@@ -28,6 +28,10 @@ class InMemoryFeedbackStore:
     items: list[Feedback] = field(default_factory=list)
 
     async def add(self, item: Feedback) -> int:
+        for i, existing in enumerate(self.items):
+            if (existing.request_id, existing.user_id) == (item.request_id, item.user_id):
+                self.items[i] = item  # last vote wins
+                return i + 1
         self.items.append(item)
         return len(self.items)
 
@@ -40,7 +44,10 @@ class PostgresFeedbackStore:
         async with self._pool.connection() as conn:
             cur = await conn.execute(
                 "INSERT INTO feedback (request_id, user_id, rating, comment) "
-                "VALUES (%s, %s, %s, %s) RETURNING id",
+                "VALUES (%s, %s, %s, %s) "
+                "ON CONFLICT (request_id, user_id) DO UPDATE SET "
+                "rating = EXCLUDED.rating, comment = EXCLUDED.comment, created_at = now() "
+                "RETURNING id",
                 (item.request_id, item.user_id, 1 if item.rating == "up" else -1, item.comment),
             )
             row = await cur.fetchone()

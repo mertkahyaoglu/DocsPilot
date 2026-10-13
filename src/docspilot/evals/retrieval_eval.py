@@ -9,7 +9,13 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 
 from docspilot.evals.dataset import GoldenCase
-from docspilot.evals.metrics import hit_at_k, mean, recall_at_k, reciprocal_rank
+from docspilot.evals.metrics import (
+    hit_at_k,
+    mean,
+    recall_at_k,
+    reciprocal_rank,
+    unique_in_order,
+)
 from docspilot.rag.embeddings import Embedder
 from docspilot.rag.rerank import NoopReranker, Reranker
 from docspilot.rag.retrieve import RetrievalConfig, Retriever
@@ -36,7 +42,10 @@ async def evaluate(strategy: Strategy, cases: list[GoldenCase], k: int) -> Retri
     recalls, hits, rrs = [], [], []
     per_case: dict[str, float] = {}
     for case in targets:
-        ranked = await strategy(case.question)
+        # Every rung is compared at the same unit: the top-k *documents*. Chunk lists are
+        # deduped first, otherwise a rung that returns several chunks per document is
+        # silently handicapped against one that returns many documents.
+        ranked = unique_in_order(await strategy(case.question))[:k]
         r = recall_at_k(ranked, case.expected_sources, k)
         recalls.append(r)
         hits.append(hit_at_k(ranked, case.expected_sources, k))
@@ -57,21 +66,33 @@ def strategies(
     async def keyword_only(q: str) -> list[str]:
         return [h.chunk.path for h in await store.search_keyword(q, 40)]
 
+    # `hybrid` ranks documents (all fused candidates). `hybrid@chunks` is the production
+    # setting: only the top-k *chunks* reach the model, which may cover fewer documents.
     hybrid = Retriever(
+        store,
+        embedder,
+        NoopReranker(),
+        RetrievalConfig(k_final=candidates, n_candidates=candidates),
+    )
+    hybrid_chunks = Retriever(
         store, embedder, NoopReranker(), RetrievalConfig(k_final=k, n_candidates=candidates)
     )
 
     async def hybrid_fn(q: str) -> list[str]:
         return [h.chunk.path for h in (await hybrid.search(q)).hits]
 
+    async def hybrid_chunks_fn(q: str) -> list[str]:
+        return [h.chunk.path for h in (await hybrid_chunks.search(q)).hits]
+
     ladder: dict[str, Strategy] = {
         "vector": vector_only,
         "keyword": keyword_only,
         "hybrid": hybrid_fn,
+        "hybrid@chunks": hybrid_chunks_fn,
     }
     if not isinstance(reranker, NoopReranker):
         full = Retriever(
-            store, embedder, reranker, RetrievalConfig(k_final=k, n_candidates=candidates)
+            store, embedder, reranker, RetrievalConfig(k_final=candidates, n_candidates=candidates)
         )
 
         async def hybrid_rerank(q: str) -> list[str]:

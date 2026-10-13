@@ -251,17 +251,29 @@ recall@k (did the needed documents appear?), hit@k, MRR (how high?). Computed pe
 document, not per chunk. The runner reports an **ablation ladder** (vector → keyword
 → hybrid → +rerank) so each added component has to earn its keep.
 
-Real result from this repo with the offline stand-in embedder: keyword search
-(recall@5 0.98) beats hybrid (0.87) because the vector leg is weak, so fusing it
-in *hurts*. That is exactly why you measure instead of assuming "hybrid is better".
-Do not extrapolate to Voyage embeddings: rerun with keys (`make eval-retrieval-live`).
+Real result from this repo with the offline stand-in embedder (all rungs compared as
+top-5 *documents*): keyword 0.98 recall@5, hybrid 0.90, vector 0.87. Fusing a weak
+vector leg into a strong keyword leg *hurts*: exactly why you measure instead of
+assuming "hybrid is better". (A first version of this ablation compared chunks to
+documents and overstated the gap: an eval harness has bugs too; review it like code.)
+`hybrid@chunks` is the production setting, where only the top-5 *chunks* reach the
+model and may cover fewer documents. Do not extrapolate to Voyage embeddings: rerun
+with keys (`make eval-retrieval-live`).
 
 ### Answer grading: deterministic first, judge second
 `evals/answers_eval.py::grade_case`. Everything that can be checked without a model
-is: did it propose a ticket the user never asked for (injection cases), did it
-repeat a forbidden string, did it search for small talk, are citations real. The LLM
-judge is used only for meaning: *were the facts conveyed, did it abstain, is every
-claim grounded in the passages it was shown*.
+is: did it propose a ticket the user never asked for (injection cases), does the
+proposed ticket carry the ids from the request, did it search for small talk, did it
+look before abstaining, did it leak an exfiltration token. The LLM judge is used only
+for meaning: *were the facts conveyed, did it abstain, is every claim grounded in the
+passages it was shown, did it relay instructions embedded in a document*.
+
+Two mistakes worth remembering (both caught in review):
+- `must_not` substrings are for *harmful compliance tokens* (an attacker's address),
+  never for positive-claim phrases: a correct denial ("Bitcoin is not supported") and a
+  correct warning quote the very strings you would forbid.
+- The judge must see exactly what the agent saw (path, section, **updated date**).
+  Otherwise "prefer the newer policy" answers are marked ungrounded.
 
 ### A judge is a model you must evaluate
 Judges are biased, lenient, and sensitive to wording. `evals/judge_calibration.jsonl`
@@ -275,8 +287,13 @@ supplied so groundedness is checkable, untrusted text delivered as JSON data.
 - ~50 cases: one flipped case = 2 points. Reports include a **Wilson 95% interval**;
   a 3-point difference between two runs is noise. Compare per-case with
   `evals compare a.json b.json` (what did the change fix, what did it break?).
-- LLM runs are non-deterministic: baseline checks use tolerances and, per category,
-  looser ones (n is tiny).
+- LLM runs are non-deterministic: the answers gate uses only the **overall** pass rate
+  with a tolerance. Categories hold 3-5 cases, so one flip moves a category 20-30
+  points: report them, never gate on them. Infra failures (API/judge errors) are
+  reported separately and trip their own check instead of silently counting as
+  model failures. Retrieval metrics *are* deterministic, so their tolerance is 0.
+- A baseline records judge model, embedder and case count; mismatches are refused
+  rather than reported as regressions. `--limit` is stratified across categories.
 - Report **cost and latency** with quality; a prompt that is +2% better and 3x the
   tokens is a decision, not a win.
 - Never tune on the same cases you report. As the set grows, hold out a split.
