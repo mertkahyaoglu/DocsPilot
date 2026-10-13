@@ -41,3 +41,14 @@ async def client(app: FastAPI) -> AsyncIterator[httpx.AsyncClient]:
         transport = httpx.ASGITransport(app=app)
         async with httpx.AsyncClient(transport=transport, base_url="http://test") as c:
             yield c
+
+
+@pytest.fixture
+def use_llm(app: FastAPI):  # type: ignore[no-untyped-def]
+    """Swap the model behind a running app (the agent captured the original at startup)."""
+
+    def _set(llm: object) -> None:
+        app.state.llm = llm
+        app.state.agent._llm = llm
+
+    return _set

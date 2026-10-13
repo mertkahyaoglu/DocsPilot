@@ -58,3 +58,66 @@ cost/observability work in Phase 5.
 | 429 storms | no backoff / no limits | SDK retries; per-user limits in Phase 6 |
 | Provider text shown to users | raw exception passthrough | `LLMError.public_message` |
 | "It worked yesterday" | prompt edited in place | versioned prompts + sha in logs |
+
+---
+
+## Phase 2: Tool use and structured output
+
+### Tool use = a loop you own
+The model never executes anything. It emits `tool_use` blocks; your code runs
+them and sends `tool_result` blocks back; repeat until it answers in text.
+`agent/loop.py` is that loop in ~100 lines. A framework wraps exactly this.
+
+What separates the toy loop from a production one:
+| Concern | Here |
+|---|---|
+| Runaway loops | hard step budget (`max_agent_steps`), then a clean error |
+| Slow/hung tools | per-call timeout, error result back to the model |
+| Parallel calls | read tools run with `asyncio.gather`; **all** results go back in one user message (splitting them teaches the model to stop parallelising) |
+| Bad model input | Pydantic validation; the error text goes back as an `is_error` result so the model can self-correct |
+| Tool bugs | contained; the model sees "internal error", never your stack trace or secrets |
+| Output size | tool results truncated before re-entering the context |
+
+### Define tools with one source of truth
+`agent/tools.py`: a Pydantic model is the input contract *and* the JSON schema
+sent to the model (`anthropic.transform_schema`), with `strict: true` so the model's
+arguments are guaranteed schema-valid. Constraints the strict schema cannot express
+(lengths, patterns) are still enforced by Pydantic on our side: the model proposes,
+your code disposes. Tool order is sorted so the prompt prefix is stable for caching.
+
+Write good tool descriptions: they are prompts. Say *when* to call, *when not to*,
+and what the result means.
+
+### Side effects need a human gate
+`create_ticket` is a write. The loop never runs it directly: it parks the whole
+conversation state under a random, single-use, expiring `pending_id`, streams a
+`confirmation_required` event with the **exact arguments**, and stops. The client
+answers `{pending_id, approve}`; the server runs the arguments **it stored**, so
+a client (or an injected prompt) cannot alter what was approved. Execution is
+idempotent (`pending_id:call_id` key), so a retry cannot create two tickets.
+
+Design rule: the model may *suggest* actions; only authenticated humans *authorise*
+them. The `current_user_id` dependency is the seam Phase 6 fills with real auth;
+tickets and pending actions are already owner-scoped.
+
+### Structured output vs tool use
+Use `output_config.format` (JSON schema) when you want *data back* (`/v1/triage`);
+use tools when you want the model to *act or fetch*. Constrained decoding makes
+valid JSON the default, but you still validate (Pydantic), and you still handle the
+two cases the guarantee does not cover: a refusal and a truncation (`max_tokens`).
+Triage runs on the small model at `effort=low`: classification does not need the
+big model, which is the first taste of Phase 5's routing and cost work.
+
+### Model quirks worth knowing
+- Forced tool choice (`tool_choice: any|tool`) is rejected by current models. Steer
+  with the prompt and use `strict` + structured outputs for guarantees.
+- Replay `result.content` unchanged between loop turns (thinking blocks are bound
+  to the turn). The loop stores the raw blocks in `PendingAction.messages`.
+
+### What breaks in production
+| Symptom | Cause | Guard |
+|---|---|---|
+| Duplicate tickets | retry or double click | single-use pending id + idempotency key |
+| Model "creates" a ticket in prose | no tool result | prompt rule + tool result is the only source of truth |
+| Infinite tool loop | model keeps retrying a failing call | step budget, "do not retry more than once" |
+| Pending actions lost on deploy | in-memory store | interface exists; shared store in Phase 7 |

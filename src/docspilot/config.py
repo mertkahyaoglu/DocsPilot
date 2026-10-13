@@ -51,6 +51,10 @@ class Settings(BaseSettings):
     web_dir: Path = PROJECT_ROOT / "web"
     answer_prompt_version: int | None = None  # None = latest
 
+    max_agent_steps: int = Field(default=6, ge=1, le=20)
+    tool_timeout_s: float = Field(default=15.0, gt=0)
+    confirmation_ttl_s: int = Field(default=600, ge=30)
+
     max_history_messages: int = Field(default=20, ge=1)
     max_message_chars: int = Field(default=4000, ge=1)  # user messages
     max_assistant_chars: int = Field(default=20_000, ge=1)  # prior answers echoed back

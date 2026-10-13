@@ -28,6 +28,12 @@
   .msg.user { align-self: flex-end; background: var(--user); border-color: transparent; }
   .msg.error { color: var(--error); }
   .meta { color: var(--muted); font-size: 12px; margin-top: 6px; }
+  .msg.confirm { border-color: var(--accent); }
+  .msg.confirm pre { margin: 8px 0; padding: 8px; border-radius: 8px; font-size: 12px;
+                     background: var(--bg); overflow-x: auto; white-space: pre-wrap; }
+  .row { display: flex; gap: 8px; }
+  .row button { padding: 8px 14px; }
+  button.secondary { background: transparent; color: var(--text); border: 1px solid var(--border); }
   form { display: flex; gap: 8px; padding: 12px 0 20px; }
   textarea { flex: 1; resize: none; border: 1px solid var(--border); border-radius: 10px;
              padding: 10px 12px; font: inherit; background: var(--panel); color: var(--text); }
@@ -52,6 +58,7 @@ const form = document.getElementById("form");
 const input = document.getElementById("input");
 const send = document.getElementById("send");
 const history = [];
+const MAX_TURNS = 20;           // keep in sync with DOCSPILOT_MAX_HISTORY_MESSAGES
 
 function bubble(role, text = "") {
   const el = document.createElement("div");
@@ -91,54 +98,116 @@ function errorText(body, fallback) {
   return fallback;
 }
 
-const MAX_TURNS = 20;           // keep in sync with DOCSPILOT_MAX_HISTORY_MESSAGES
 function windowed() {
   let h = history.slice(-MAX_TURNS);
   while (h.length && h[0].role !== "user") h = h.slice(1);   // must start with a user turn
   return h;
 }
 
-let busy = false;
-form.addEventListener("submit", async (e) => {
-  e.preventDefault();
-  const text = input.value.trim();
-  if (!text || busy) return;
-  busy = true; input.value = ""; send.disabled = true;
-  history.push({ role: "user", content: text });
-  bubble("user", text);
-  const out = bubble("assistant");
-  let answer = "", ok = false;
-  try {
-    const res = await fetch("/v1/chat", {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ messages: windowed() }),
-    });
-    if (!res.ok) {
-      const body = await res.json().catch(() => null);
-      throw new Error(errorText(body, res.statusText));
-    }
-    for await (const { event, data } of sse(res)) {
-      if (event === "delta") { answer += data.text; out.textContent = answer; }
-      else if (event === "reset") { answer = ""; out.textContent = ""; }
-      else if (event === "error") {
-        answer = ""; out.classList.add("error"); out.textContent = data.message;
-      } else if (event === "done") {
-        ok = true;
+async function post(url, payload) {
+  const res = await fetch(url, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+  if (!res.ok) {
+    const body = await res.json().catch(() => null);
+    throw new Error(errorText(body, res.statusText));
+  }
+  return res;
+}
+
+// Render one streamed turn into `out`. Returns {answer, ok, pending}.
+async function consume(res, out) {
+  const state = { answer: "", ok: false, pending: null };
+  const status = document.createElement("div");
+  status.className = "meta";
+  for await (const { event, data } of sse(res)) {
+    if (event === "delta") { state.answer += data.text; out.textContent = state.answer; }
+    else if (event === "reset") { state.answer = ""; out.textContent = ""; }
+    else if (event === "tool_start") { status.textContent = `Using ${data.name}…`; out.after(status); }
+    else if (event === "tool_end") { status.remove(); }
+    else if (event === "confirmation_required") { state.pending = data; }
+    else if (event === "error") {
+      state.answer = ""; out.classList.add("error"); out.textContent = data.message;
+    } else if (event === "done") {
+      state.ok = true;
+      if (data.usage) {
         const m = document.createElement("div"); m.className = "meta";
         m.textContent = `${data.model} · ${data.usage.input_tokens} in / ${data.usage.output_tokens} out`;
         out.appendChild(m);
       }
-      log.scrollTop = log.scrollHeight;
     }
+    log.scrollTop = log.scrollHeight;
+  }
+  status.remove();
+  return state;
+}
+
+// Show the exact action the server will run and let the human decide.
+function confirmCard(pending, onDecision) {
+  const card = document.createElement("div");
+  card.className = "msg confirm";
+  const title = document.createElement("strong");
+  title.textContent = "Approve this action?";
+  card.appendChild(title);
+  for (const item of pending.items) {
+    const p = document.createElement("div");
+    p.textContent = item.summary;
+    const pre = document.createElement("pre");
+    pre.textContent = JSON.stringify(item.arguments, null, 2);
+    card.append(p, pre);
+  }
+  const row = document.createElement("div");
+  row.className = "row";
+  for (const [label, approve] of [["Approve", true], ["Reject", false]]) {
+    const b = document.createElement("button");
+    b.type = "button"; b.textContent = label;
+    if (!approve) b.className = "secondary";
+    b.addEventListener("click", () => { card.remove(); onDecision(approve); });
+    row.appendChild(b);
+  }
+  card.appendChild(row);
+  log.appendChild(card);
+  log.scrollTop = log.scrollHeight;
+}
+
+let busy = false;
+function setBusy(v) { busy = v; send.disabled = v; if (!v) input.focus(); }
+
+// One user-visible turn: stream, then maybe pause for confirmation and continue.
+async function runTurn(requestFn) {
+  const out = bubble("assistant");
+  const texts = [];
+  try {
+    let state = await consume(await requestFn(), out);
+    texts.push(state.answer);
+    while (state.pending) {
+      const approve = await new Promise((resolve) => confirmCard(state.pending, resolve));
+      const next = bubble("assistant");
+      state = await consume(
+        await post("/v1/chat/confirm", { pending_id: state.pending.pending_id, approve }), next);
+      texts.push(state.answer);
+    }
+    return { ok: state.ok, text: texts.filter(Boolean).join("\n\n") };
   } catch (err) {
     out.classList.add("error"); out.textContent = String(err.message ?? err);
-  } finally {
-    // Only a completed turn becomes history; otherwise drop the user turn so roles alternate.
-    if (ok && answer) history.push({ role: "assistant", content: answer });
-    else history.pop();
-    busy = false; send.disabled = false; input.focus();
+    return { ok: false, text: "" };
   }
+}
+
+form.addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const text = input.value.trim();
+  if (!text || busy) return;
+  setBusy(true); input.value = "";
+  history.push({ role: "user", content: text });
+  bubble("user", text);
+  const { ok, text: answer } = await runTurn(() => post("/v1/chat", { messages: windowed() }));
+  // Only a completed turn becomes history; otherwise drop the user turn so roles alternate.
+  if (ok && answer) history.push({ role: "assistant", content: answer });
+  else history.pop();
+  setBusy(false);
 });
 input.addEventListener("keydown", (e) => {
   if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); form.requestSubmit(); }
