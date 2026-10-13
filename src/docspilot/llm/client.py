@@ -3,7 +3,7 @@
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterator
+from collections.abc import AsyncGenerator
 from typing import Any
 
 import anthropic
@@ -37,7 +37,7 @@ class AnthropicLLM:
         self._client = client
         self._refusal_fallback = refusal_fallback
 
-    async def stream(self, request: LLMRequest) -> AsyncIterator[LLMEvent]:
+    async def stream(self, request: LLMRequest) -> AsyncGenerator[LLMEvent, None]:
         kwargs = self._build_kwargs(request)
         use_fallback = self._refusal_fallback and request.model in FALLBACK_CAPABLE_MODELS
         try:

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterator, Callable, Sequence
+from collections.abc import AsyncGenerator, Callable, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -32,7 +32,7 @@ class FakeLLM:
         self._i = 0
         self.requests: list[LLMRequest] = []
 
-    async def stream(self, request: LLMRequest) -> AsyncIterator[LLMEvent]:
+    async def stream(self, request: LLMRequest) -> AsyncGenerator[LLMEvent, None]:
         self.requests.append(request)
         script = self._next(request)
         if script.error is not None:

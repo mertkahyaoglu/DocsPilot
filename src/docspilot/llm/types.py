@@ -3,7 +3,7 @@ not on the Anthropic SDK, which keeps tests offline and the SDK swappable."""
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterator
+from collections.abc import AsyncGenerator
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
@@ -78,7 +78,7 @@ LLMEvent = TextDelta | StreamReset | LLMResult
 
 
 class LLM(Protocol):
-    def stream(self, request: LLMRequest) -> AsyncIterator[LLMEvent]:
+    def stream(self, request: LLMRequest) -> AsyncGenerator[LLMEvent, None]:
         """Yield TextDelta (and rarely StreamReset) events, then exactly one LLMResult."""
         ...
 
