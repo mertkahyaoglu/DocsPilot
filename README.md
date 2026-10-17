@@ -22,6 +22,24 @@ make eval-answers           # end-to-end agent + LLM judge (needs keys, spends c
 docker compose -f docker-compose.yml -f docker-compose.observability.yml up -d   # Jaeger + Prometheus
 ```
 
+## Run on Cloudflare Workers AI (no Anthropic key)
+
+```bash
+# .env
+DOCSPILOT_LLM_BACKEND=cloudflare
+CLOUDFLARE_ACCOUNT_ID=...
+CLOUDFLARE_API_TOKEN=...     # account token with Workers AI access
+```
+
+One credential covers chat (`@cf/openai/gpt-oss-120b` by default; light/judge/tickets/failover
+roles have their own defaults, override with `DOCSPILOT_MODEL_*`), embeddings
+(`@cf/baai/bge-m3`, 1024 dims, matches the schema) and reranking
+(`@cf/baai/bge-reranker-base`). Prices for the common models are in `pricing.py`.
+What does not carry over from Claude: prompt caching, `effort`, thinking blocks and the
+refusal fallback are ignored, and tool-calling quality depends on the open model (in a quick
+check `gpt-oss-120b` finished the tool loop; `llama-3.3-70b` called the tool a second time
+instead of answering). Re-run `make eval-answers` after switching models: the numbers will differ.
+
 ## Status
 
 | Phase | Topic | State |

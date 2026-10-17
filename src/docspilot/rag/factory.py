@@ -11,9 +11,9 @@ from typing import Any
 from docspilot.config import Settings
 from docspilot.feedback import FeedbackStore, InMemoryFeedbackStore
 from docspilot.logging import get_logger
-from docspilot.rag.embeddings import Embedder, HashEmbedder, VoyageEmbedder
+from docspilot.rag.embeddings import CloudflareEmbedder, Embedder, HashEmbedder, VoyageEmbedder
 from docspilot.rag.ingest import ingest_corpus
-from docspilot.rag.rerank import NoopReranker, Reranker, VoyageReranker
+from docspilot.rag.rerank import CloudflareReranker, NoopReranker, Reranker, VoyageReranker
 from docspilot.rag.retrieve import RetrievalConfig, Retriever
 from docspilot.rag.store import ChunkStore, InMemoryChunkStore
 from docspilot.tickets import InMemoryTicketStore, TicketStore
@@ -39,6 +39,12 @@ def _key(settings: Settings) -> str:
     return settings.voyage_api_key.get_secret_value()
 
 
+def _cf(settings: Settings) -> tuple[str, str]:
+    if not (settings.cloudflare_account_id and settings.cloudflare_api_token):  # pragma: no cover
+        raise RuntimeError("Cloudflare credentials missing")
+    return settings.cloudflare_account_id, settings.cloudflare_api_token.get_secret_value()
+
+
 @asynccontextmanager
 async def build_rag(settings: Settings, *, ingest_on_start: bool = True) -> AsyncIterator[RagStack]:
     # An ExitStack closes whatever was created even if a later step fails.
@@ -48,6 +54,10 @@ async def build_rag(settings: Settings, *, ingest_on_start: bool = True) -> Asyn
             voyage = VoyageEmbedder(_key(settings), model=settings.voyage_embed_model)
             stack.push_async_callback(voyage.aclose)
             embedder = voyage
+        elif settings.resolved_embedder == "cloudflare":
+            cf_emb = CloudflareEmbedder(*_cf(settings), model=settings.cf_embed_model)
+            stack.push_async_callback(cf_emb.aclose)
+            embedder = cf_emb
         else:
             log.warning("using_hash_embedder", note="offline stand-in; retrieval quality is poor")
             embedder = HashEmbedder()
@@ -57,6 +67,10 @@ async def build_rag(settings: Settings, *, ingest_on_start: bool = True) -> Asyn
             voyage_rr = VoyageReranker(_key(settings), model=settings.voyage_rerank_model)
             stack.push_async_callback(voyage_rr.aclose)
             reranker = voyage_rr
+        elif settings.resolved_rerank == "cloudflare":
+            cf_rr = CloudflareReranker(*_cf(settings), model=settings.cf_rerank_model)
+            stack.push_async_callback(cf_rr.aclose)
+            reranker = cf_rr
 
         pool = None
         store: ChunkStore

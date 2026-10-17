@@ -37,8 +37,7 @@ from docspilot.budget import Budget, InMemorySpendStore, PostgresSpendStore
 from docspilot.cache import CorpusVersionProvider, ResponseCache
 from docspilot.config import Settings, get_settings
 from docspilot.intents import IntentClassifier, LLMIntentClassifier
-from docspilot.llm.client import AnthropicLLM, build_anthropic_client
-from docspilot.llm.fake import FakeLLM, Script
+from docspilot.llm.factory import create_llm
 from docspilot.llm.instrumented import InstrumentedLLM
 from docspilot.llm.resilient import ResilientLLM
 from docspilot.llm.types import LLM
@@ -78,13 +77,9 @@ def create_app(
             app.state.telemetry = telemetry
 
             base_llm: LLM
-            if llm is None and settings.llm_backend == "fake":
-                canned = Script(text="(offline fake model) Set ANTHROPIC_API_KEY for real answers.")
-                base_llm = FakeLLM([canned])
-            elif llm is None:
-                client = build_anthropic_client(settings)
-                stack.push_async_callback(client.close)
-                base_llm = AnthropicLLM(client, refusal_fallback=settings.refusal_fallback)
+            if llm is None:
+                base_llm, close_llm = create_llm(settings)
+                stack.push_async_callback(close_llm)
             else:
                 base_llm = llm
             # Every model call goes through: failover/breaker -> instrumentation -> client.

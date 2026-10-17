@@ -113,3 +113,42 @@ class VoyageEmbedder:
 
     async def aclose(self) -> None:
         await self._client.aclose()
+
+
+class CloudflareEmbedder:
+    """Workers AI embeddings. bge-m3 returns 1024 dims, matching the `vector(1024)` schema;
+    a model with another dimension needs a new migration and a full re-ingest."""
+
+    dim = DIM
+
+    def __init__(
+        self,
+        account_id: str,
+        api_token: str,
+        *,
+        model: str = "@cf/baai/bge-m3",
+        client: httpx.AsyncClient | None = None,
+        batch_size: int = 50,
+    ) -> None:
+        self.name = f"cloudflare:{model}"
+        self._model = model
+        self._batch = batch_size
+        self._client = client or httpx.AsyncClient(
+            base_url=f"https://api.cloudflare.com/client/v4/accounts/{account_id}/ai/run",
+            headers={"Authorization": f"Bearer {api_token}"},
+            timeout=httpx.Timeout(30.0, connect=5.0),
+        )
+
+    async def embed(self, texts: list[str], input_type: InputType) -> list[list[float]]:
+        out: list[list[float]] = []
+        for i in range(0, len(texts), self._batch):
+            batch = texts[i : i + self._batch]
+            data = await _post_with_retries(self._client, f"/{self._model}", {"text": batch})
+            vectors = (data.get("result") or {}).get("data") or []
+            if len(vectors) != len(batch) or any(len(v) != self.dim for v in vectors):
+                raise VoyageError("unexpected embedding shape from Workers AI")
+            out.extend(vectors)
+        return out
+
+    async def aclose(self) -> None:
+        await self._client.aclose()

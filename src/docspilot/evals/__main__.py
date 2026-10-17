@@ -105,7 +105,7 @@ async def cmd_answers(args: argparse.Namespace) -> int:
     from docspilot.agent.pending import InMemoryPendingStore
     from docspilot.evals.answers_eval import GradedCase, run_answers_eval
     from docspilot.evals.judge import judge
-    from docspilot.llm.client import AnthropicLLM, build_anthropic_client
+    from docspilot.llm.factory import create_llm
     from docspilot.prompts import PromptRegistry
     from docspilot.rag.factory import build_rag
 
@@ -124,8 +124,7 @@ async def cmd_answers(args: argparse.Namespace) -> int:
     answer_prompt = registry.get("answer", args.answer_prompt_version)
     judge_prompt = registry.get("judge")
 
-    client = build_anthropic_client(settings)
-    llm = AnthropicLLM(client, refusal_fallback=settings.refusal_fallback)
+    llm, close_llm = create_llm(settings)
     done = 0
 
     def progress(g: GradedCase) -> None:
@@ -189,7 +188,7 @@ async def cmd_answers(args: argparse.Namespace) -> int:
                 "n_cases": len(cases),
             }
     finally:
-        await client.close()
+        await close_llm()
 
     summary = summarize_answers(graded)
     print("\n" + render_answers(summary, graded))
@@ -222,14 +221,13 @@ async def cmd_answers(args: argparse.Namespace) -> int:
 
 async def cmd_calibrate(args: argparse.Namespace) -> int:
     from docspilot.evals.judge import JudgeError, JudgeInput, judge
-    from docspilot.llm.client import AnthropicLLM, build_anthropic_client
+    from docspilot.llm.factory import create_llm
     from docspilot.prompts import PromptRegistry
 
     settings = _settings(False)
     model = args.judge_model or settings.model_judge
     system = PromptRegistry(settings.prompts_dir).get("judge").text
-    client = build_anthropic_client(settings)
-    llm = AnthropicLLM(client, refusal_fallback=settings.refusal_fallback)
+    llm, close_llm = create_llm(settings)
     rows = [json.loads(line) for line in CALIBRATION.read_text().splitlines() if line.strip()]
     if not rows:
         print("calibration set is empty", file=sys.stderr)
@@ -266,7 +264,7 @@ async def cmd_calibrate(args: argparse.Namespace) -> int:
                     (row["id"], [k for k, v in ok.items() if not v], verdict.reasoning)
                 )
     finally:
-        await client.close()
+        await close_llm()
     n = len(rows)
     print(f"judge={model} n={n}")
     for k, v in agree.items():
