@@ -40,6 +40,25 @@ refusal fallback are ignored, and tool-calling quality depends on the open model
 check `gpt-oss-120b` finished the tool loop; `llama-3.3-70b` called the tool a second time
 instead of answering). Re-run `make eval-answers` after switching models: the numbers will differ.
 
+## Evalite (second eval runner + UI)
+
+[Evalite](https://www.evalite.dev) (`evalite@beta`, built on Vitest) runs the same `evals/golden.jsonl`
+against the *running API*, with a local UI for browsing cases, scores, tokens and costs.
+
+```bash
+npm install
+make evalite-server          # terminal 1: API with rate limits / budgets / response cache off
+make evalite-retrieval       # terminal 2: recall@5, hit@5, MRR: no model calls
+EVAL_LIMIT=5 make evalite    # answer suites; spends model credits, so narrow it while developing
+make evalite-ui              # watch mode + UI at http://localhost:3006
+```
+
+Suites (`evals/evalite/`): retrieval, and answers split by behaviour (product questions,
+must-abstain, injection, direct attacks, ticket human gate, small talk). Scorers are
+deterministic or lexical proxies (no judge model); the Python harness adds the LLM judge.
+Filters: `EVAL_CATEGORIES`, `EVAL_LIMIT`, `EVAL_IDS`. A full answers run is ~65 chats
+and ~500k input tokens: use a cheap model (`DOCSPILOT_MODEL_ANSWER=@cf/ibm-granite/granite-4.0-h-micro`).
+
 ## Status
 
 | Phase | Topic | State |

@@ -24,3 +24,5 @@ evals/results/
 .venv-*/
 finetune_out/
 .claude/
+node_modules/
+.evalite/
