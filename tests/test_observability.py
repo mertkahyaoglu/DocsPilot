@@ -15,7 +15,7 @@ from docspilot.cache import CachedAnswer, ResponseCache, cache_key, corpus_versi
 from docspilot.config import Settings
 from docspilot.llm.errors import LLMError
 from docspilot.llm.fake import FakeLLM, Script
-from docspilot.llm.types import LLMRequest, ToolCall
+from docspilot.llm.types import LLMRequest, ToolCall, Usage
 from docspilot.logging import _add_trace_ids
 from docspilot.redact import redact
 from tests.test_chat_api import parse_sse
@@ -670,3 +670,38 @@ def test_redaction_covers_common_token_shapes() -> None:
     assert (
         redact("invoice INV-2024-0042 total $1,240.00") == "invoice INV-2024-0042 total $1,240.00"
     )
+
+
+async def test_done_event_reports_the_estimated_cost(settings: Settings) -> None:
+    _, client, gen = await open_client(settings, FakeLLM(base_script), response_cache_ttl_s=3600)
+    first = parse_sse((await client.post("/v1/chat", json=BODY)).text)[-1][1]
+    # 2 model steps x (10 in, 5 out) at claude-opus-5-5 prices ($4 / $20 per M tokens)
+    assert first["cost_usd"] == pytest.approx(0.00028, abs=1e-6)
+    again = parse_sse((await client.post("/v1/chat", json=BODY)).text)[-1][1]
+    assert again["cached"] is True and again["cost_usd"] == 0.0
+    await close(gen)
+
+
+async def test_cost_is_null_for_unpriced_models_and_priced_for_workers_ai(
+    settings: Settings,
+) -> None:
+    body = {"messages": [{"role": "user", "content": "hello there"}]}
+    _, client, gen = await open_client(
+        settings,
+        FakeLLM([Script(text="hi")]),
+        model_answer="mystery-model-1",
+        response_cache_ttl_s=0,
+    )
+    done = parse_sse((await client.post("/v1/chat", json=body)).text)[-1][1]
+    assert done["cost_usd"] is None  # never invent a number
+    await close(gen)
+
+    _, client, gen = await open_client(
+        settings,
+        FakeLLM([Script(text="hi", usage=Usage(1000, 500))]),
+        model_answer="@cf/openai/gpt-oss-120b",
+        response_cache_ttl_s=0,
+    )
+    done = parse_sse((await client.post("/v1/chat", json=body)).text)[-1][1]
+    assert done["cost_usd"] == pytest.approx(1000 * 0.35 / 1e6 + 500 * 0.75 / 1e6, abs=1e-7)
+    await close(gen)

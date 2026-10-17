@@ -78,6 +78,12 @@ async function post(url, payload) {
   return res;
 }
 
+function formatCost(usd) {
+  if (usd === null || usd === undefined) return "cost n/a";        // unpriced model
+  if (usd === 0) return "$0 (cached)";
+  return usd < 0.0001 ? "<$0.0001" : "$" + usd.toFixed(usd < 0.01 ? 5 : 4);
+}
+
 function feedbackButtons(requestId) {
   const wrap = document.createElement("span");
   for (const [label, rating] of [["👍", "up"], ["👎", "down"]]) {
@@ -136,7 +142,7 @@ async function consume(res, out) {
       state.ok = true;
       if (data.usage) {
         const m = document.createElement("div"); m.className = "meta";
-        m.textContent = `${data.model} · ${data.usage.input_tokens} in / ${data.usage.output_tokens} out `;
+        m.textContent = `${data.model} · ${data.usage.input_tokens} in / ${data.usage.output_tokens} out · ${formatCost(data.cost_usd)} `;
         if (data.request_id) m.appendChild(feedbackButtons(data.request_id));
         out.appendChild(m);
       }
