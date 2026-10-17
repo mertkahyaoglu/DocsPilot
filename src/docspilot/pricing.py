@@ -25,6 +25,15 @@ PRICES: dict[str, Price] = {
     "claude-sonnet-5": Price(2.0, 10.0),
     "claude-haiku-5-5": Price(0.10, 0.50),
     "claude-fable-5-1": Price(10.0, 50.0),
+    # Cloudflare Workers AI (USD per 1M tokens, from the models API at the time of writing)
+    "@cf/openai/gpt-oss-120b": Price(0.35, 0.75),
+    "@cf/openai/gpt-oss-20b": Price(0.20, 0.30),
+    "@cf/meta/llama-3.3-70b-instruct-fp8-fast": Price(0.293, 2.253),
+    "@cf/meta/llama-4-scout-17b-16e-instruct": Price(0.27, 0.85),
+    "@cf/mistralai/mistral-small-3.1-24b-instruct": Price(0.351, 0.555),
+    "@cf/google/gemma-4-26b-a4b-it": Price(0.10, 0.30),
+    "@cf/zai-org/glm-4.7-flash": Price(0.0605, 0.40),
+    "@cf/qwen/qwen3-30b-a3b-fp8": Price(0.0509, 0.335),
 }
 
 

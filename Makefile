@@ -1,4 +1,4 @@
-.PHONY: bench-vector finetune mcp up down smoke load docker-build dev dev-offline test test-integration lint fmt typecheck check db ingest eval-retrieval eval-answers eval-calibrate
+.PHONY: evalite-server evalite-retrieval evalite evalite-ui bench-vector finetune mcp up down smoke load docker-build dev dev-offline test test-integration lint fmt typecheck check db ingest eval-retrieval eval-answers eval-calibrate
 
 dev:
 	uv run uvicorn --factory docspilot.api.app:create_app --reload --port 8000
@@ -75,3 +75,21 @@ finetune:
 
 mcp:
 	uv run python -m docspilot.mcp_server
+
+# ---- Evalite (TypeScript runner + UI over the same golden set) ----------------------------
+# The API must run with limits/caching off for evals; then, in another terminal:
+evalite-server:
+	DOCSPILOT_RATE_LIMIT_PER_MIN=0 DOCSPILOT_USER_DAILY_BUDGET_USD=0 \
+	  DOCSPILOT_GLOBAL_DAILY_BUDGET_USD=0 DOCSPILOT_RESPONSE_CACHE_TTL_S=0 \
+	  uv run uvicorn --factory docspilot.api.app:create_app --port 8000
+
+# retrieval only: no model calls
+evalite-retrieval:
+	npx evalite run evals/evalite/retrieval.eval.ts
+
+# spends model credits: narrow with EVAL_LIMIT=5 / EVAL_CATEGORIES=smalltalk,ticket_intent / EVAL_IDS=q012
+evalite:
+	npx evalite run evals/evalite/answers.eval.ts
+
+evalite-ui:
+	npm run eval:dev

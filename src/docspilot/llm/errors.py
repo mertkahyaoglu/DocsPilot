@@ -64,9 +64,13 @@ class LLMError(Exception):
         kind: ErrorKind,
         status_code: int | None = None,
         request_id: str | None = None,
+        retry_futile: bool = False,
     ) -> None:
         super().__init__(message)
         self.kind = kind
+        #: Retryable in principle (rate limit) but not within any useful time: e.g. a
+        #: daily quota. Callers must not loop on it.
+        self.retry_futile = retry_futile
         self.status_code = status_code
         self.request_id = request_id
 

@@ -91,7 +91,8 @@ class AgentFinished:
     flags: tuple[str, ...] = ()
 
 
-_BRACKET = re.compile(r"\[([^\[\]\n]*?\.md[^\[\]\n]*)\]")
+# `[ ]` and the fullwidth `【 】` some open models use for citations
+_BRACKET = re.compile(r"[\[【]([^\[\]【】\n]*?\.md[^\[\]【】\n]*)[\]】]")
 
 
 def extract_citations(text: str, retrieved: dict[str, Source]) -> tuple[Source, ...]:

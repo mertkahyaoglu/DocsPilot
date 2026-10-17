@@ -723,3 +723,22 @@ async def test_metrics_endpoint_survives_non_ascii_authorization(settings: Setti
     res = await client.get("/metrics", headers={"authorization": "Bearer caf\u00e9".encode()})
     assert res.status_code == 401
     await close(gen)
+
+
+def test_documentation_example_credentials_are_not_treated_as_leaks() -> None:
+    allowed = ("acmebilling.example",)
+    for example in (
+        'curl -H "Authorization: Bearer ak_test_51Hq0example" https://api.acmebilling.example/v2',
+        "Authorization: Bearer YOUR_API_KEY_HERE",
+        "Authorization: Bearer xxxxxxxxxxxxxxxxxxxx",
+        "Authorization: Bearer <your-api-key>",
+    ):
+        assert check_output(example, allowed).ok, example
+    # real-looking secrets are still blocked, with or without the Bearer prefix
+    for leak in (
+        "Authorization: Bearer 9f8e7d6c5b4a39281706f5e4d3c2b1a0",
+        "key: sk-ant-api03-aB3dE5gH7jK9mN1pQ3sT5vW7yZ",
+        "token eyJhbGciOiJSUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0."
+        + "dBjftJeZ4CVPmB92K27uhbUJU1p1r_wW1gF",
+    ):
+        assert not check_output(leak, allowed).ok, leak

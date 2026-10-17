@@ -181,3 +181,10 @@ async def test_readyz_flags_embedding_model_mismatch(app, client: httpx.AsyncCli
     app.state.rag.embedder = Other()
     res = await client.get("/readyz")
     assert res.status_code == 503 and res.json()["status"] == "embedding_model_mismatch"
+
+
+def test_fullwidth_bracket_citations_from_open_models_are_parsed() -> None:
+    r = {"policies/refunds.md": Source("policies/refunds.md", "Refund Policy", "Eligibility")}
+    assert [c.path for c in extract_citations("30 days\u3010policies/refunds.md\u3011", r)] == [
+        "policies/refunds.md"
+    ]

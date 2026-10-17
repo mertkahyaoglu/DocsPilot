@@ -53,5 +53,13 @@ def redact(text: str) -> str:
     return _PHONE.sub(phone, text)
 
 
+# Documentation shows example credentials ("Bearer ak_test_51Hq0example", "YOUR_API_KEY").
+# Those are content, not leaks: blocking them would break every "show me a curl example"
+# answer. Real secrets are random strings that do not spell out these words.
+_PLACEHOLDER = re.compile(
+    r"example|your[_-]?|[_-]here\b|placeholder|dummy|sample|x{4,}|\.{3}|<|>", re.I
+)
+
+
 def contains_secret(text: str) -> bool:
-    return _SECRET.search(text) is not None
+    return any(not _PLACEHOLDER.search(m.group(0)) for m in _SECRET.finditer(text))

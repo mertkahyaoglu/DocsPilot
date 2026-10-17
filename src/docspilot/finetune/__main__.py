@@ -56,13 +56,13 @@ async def _llm_baseline(test_sets: dict[str, list[Example]]) -> dict[str, Any]:
     """Prompted small model on the same sets (needs ANTHROPIC_API_KEY; spends credits)."""
     from docspilot.config import get_settings
     from docspilot.intents import LLMIntentClassifier
-    from docspilot.llm.client import AnthropicLLM, build_anthropic_client
+    from docspilot.llm.factory import create_llm
     from docspilot.prompts import PromptRegistry
 
     settings = get_settings()
-    client = build_anthropic_client(settings)
+    llm, close_llm = create_llm(settings)
     clf = LLMIntentClassifier(
-        AnthropicLLM(client),
+        llm,
         system=PromptRegistry(settings.prompts_dir).get("triage").text,
         model=settings.model_light,
     )
@@ -80,7 +80,7 @@ async def _llm_baseline(test_sets: dict[str, list[Example]]) -> dict[str, Any]:
                 "confusions": rep.confusions,
             }
     finally:
-        await client.close()
+        await close_llm()
     return result
 
 

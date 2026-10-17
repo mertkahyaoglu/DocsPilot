@@ -258,6 +258,8 @@ async def _to_sse(
                         {
                             "stop_reason": "output_blocked",
                             "usage": asdict(event.usage),
+                            # estimated from the price table; null when the model is unpriced
+                            "cost_usd": None if cost is None else round(cost, 6),
                             "model": event.model,
                             "steps": event.steps,
                             "request_id": request_id,
@@ -308,6 +310,8 @@ async def _to_sse(
                         {
                             "stop_reason": event.stop_reason,
                             "usage": asdict(event.usage),
+                            # estimated from the price table; null when the model is unpriced
+                            "cost_usd": None if cost is None else round(cost, 6),
                             "model": event.model,
                             "steps": event.steps,
                             "request_id": request_id,
@@ -489,6 +493,7 @@ async def _replay(
             "steps": 0,
             "request_id": request_id,
             "cached": True,
+            "cost_usd": 0.0,
         },
     )
 

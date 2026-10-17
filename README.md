@@ -22,6 +22,43 @@ make eval-answers           # end-to-end agent + LLM judge (needs keys, spends c
 docker compose -f docker-compose.yml -f docker-compose.observability.yml up -d   # Jaeger + Prometheus
 ```
 
+## Run on Cloudflare Workers AI (no Anthropic key)
+
+```bash
+# .env
+DOCSPILOT_LLM_BACKEND=cloudflare
+CLOUDFLARE_ACCOUNT_ID=...
+CLOUDFLARE_API_TOKEN=...     # account token with Workers AI access
+```
+
+One credential covers chat (`@cf/openai/gpt-oss-120b` by default; light/judge/tickets/failover
+roles have their own defaults, override with `DOCSPILOT_MODEL_*`), embeddings
+(`@cf/baai/bge-m3`, 1024 dims, matches the schema) and reranking
+(`@cf/baai/bge-reranker-base`). Prices for the common models are in `pricing.py`.
+What does not carry over from Claude: prompt caching, `effort`, thinking blocks and the
+refusal fallback are ignored, and tool-calling quality depends on the open model (in a quick
+check `gpt-oss-120b` finished the tool loop; `llama-3.3-70b` called the tool a second time
+instead of answering). Re-run `make eval-answers` after switching models: the numbers will differ.
+
+## Evalite (second eval runner + UI)
+
+[Evalite](https://www.evalite.dev) (`evalite@beta`, built on Vitest) runs the same `evals/golden.jsonl`
+against the *running API*, with a local UI for browsing cases, scores, tokens and costs.
+
+```bash
+npm install
+make evalite-server          # terminal 1: API with rate limits / budgets / response cache off
+make evalite-retrieval       # terminal 2: recall@5, hit@5, MRR: no model calls
+EVAL_LIMIT=5 make evalite    # answer suites; spends model credits, so narrow it while developing
+make evalite-ui              # watch mode + UI at http://localhost:3006
+```
+
+Suites (`evals/evalite/`): retrieval, and answers split by behaviour (product questions,
+must-abstain, injection, direct attacks, ticket human gate, small talk). Scorers are
+deterministic or lexical proxies (no judge model); the Python harness adds the LLM judge.
+Filters: `EVAL_CATEGORIES`, `EVAL_LIMIT`, `EVAL_IDS`. A full answers run is ~65 chats
+and ~500k input tokens: use a cheap model (`DOCSPILOT_MODEL_ANSWER=@cf/ibm-granite/granite-4.0-h-micro`).
+
 ## Status
 
 | Phase | Topic | State |

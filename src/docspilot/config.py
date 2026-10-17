@@ -37,7 +37,16 @@ class Settings(BaseSettings):
     anthropic_api_key: SecretStr | None = Field(default=None, validation_alias="ANTHROPIC_API_KEY")
 
     # "fake" = canned offline replies (UI demos / no API key). Never allowed in prod.
-    llm_backend: Literal["anthropic", "fake"] = "anthropic"
+    llm_backend: Literal["anthropic", "cloudflare", "fake"] = "anthropic"
+    # Cloudflare Workers AI: chat models, plus embeddings and reranking (no Voyage needed).
+    cloudflare_account_id: str | None = Field(
+        default=None, validation_alias="CLOUDFLARE_ACCOUNT_ID"
+    )
+    cloudflare_api_token: SecretStr | None = Field(
+        default=None, validation_alias="CLOUDFLARE_API_TOKEN"
+    )
+    cf_embed_model: str = "@cf/baai/bge-m3"  # 1024 dims: matches the schema
+    cf_rerank_model: str = "@cf/baai/bge-reranker-base"
 
     # --- safety ---
     #: "user:key,user2:key2" (keys >= 16 chars). Required in prod; unset in dev = anonymous.
@@ -79,9 +88,10 @@ class Settings(BaseSettings):
     migrations_dir: Path = PROJECT_ROOT / "migrations"
     corpus_dir: Path = PROJECT_ROOT / "corpus"
     voyage_api_key: SecretStr | None = Field(default=None, validation_alias="VOYAGE_API_KEY")
-    embedder: Literal["auto", "voyage", "hash"] = "auto"  # auto: voyage if key else hash
+    #: auto: voyage if a Voyage key, else cloudflare if credentials, else the offline hash
+    embedder: Literal["auto", "voyage", "cloudflare", "hash"] = "auto"
     voyage_embed_model: str = "voyage-3.5"
-    rerank: Literal["auto", "voyage", "none"] = "auto"
+    rerank: Literal["auto", "voyage", "cloudflare", "none"] = "auto"
     voyage_rerank_model: str = "rerank-2.5"
     retrieval_k: int = Field(default=5, ge=1, le=20)
     retrieval_candidates: int = Field(default=20, ge=1, le=100)
@@ -134,6 +144,22 @@ class Settings(BaseSettings):
     max_assistant_chars: int = Field(default=20_000, ge=1)  # prior answers echoed back
     max_body_bytes: int = Field(default=256 * 1024, ge=1024)
 
+    def _apply_cloudflare_model_defaults(self) -> None:
+        """Anthropic model ids mean nothing to Workers AI: unless a model was set
+        explicitly, use sensible Workers AI defaults for each role."""
+        if self.llm_backend != "cloudflare":
+            return
+        defaults = {
+            "model_answer": "@cf/openai/gpt-oss-120b",
+            "model_light": "@cf/google/gemma-4-26b-a4b-it",
+            "model_judge": "@cf/openai/gpt-oss-120b",
+            "model_tickets": "@cf/openai/gpt-oss-20b",
+            "model_fallback": "@cf/meta/llama-3.3-70b-instruct-fp8-fast",
+        }
+        for name, value in defaults.items():
+            if name not in self.model_fields_set:
+                setattr(self, name, value)
+
     @property
     def strict(self) -> bool:
         """Staging and prod are internet-facing: guard rails cannot be switched off."""
@@ -144,15 +170,23 @@ class Settings(BaseSettings):
         return tuple(h.strip().lower() for h in self.allowed_hosts.split(",") if h.strip())
 
     @property
-    def resolved_embedder(self) -> Literal["voyage", "hash"]:
+    def _has_cloudflare(self) -> bool:
+        return bool(self.cloudflare_account_id and self.cloudflare_api_token)
+
+    @property
+    def resolved_embedder(self) -> Literal["voyage", "cloudflare", "hash"]:
         if self.embedder == "auto":
-            return "voyage" if self.voyage_api_key else "hash"
+            if self.voyage_api_key:
+                return "voyage"
+            return "cloudflare" if self._has_cloudflare else "hash"
         return self.embedder
 
     @property
-    def resolved_rerank(self) -> Literal["voyage", "none"]:
+    def resolved_rerank(self) -> Literal["voyage", "cloudflare", "none"]:
         if self.rerank == "auto":
-            return "voyage" if self.voyage_api_key else "none"
+            if self.voyage_api_key:
+                return "voyage"
+            return "cloudflare" if self._has_cloudflare else "none"
         return self.rerank
 
     @field_validator(
@@ -161,6 +195,8 @@ class Settings(BaseSettings):
         "database_url",
         "otlp_endpoint",
         "metrics_token",
+        "cloudflare_account_id",
+        "cloudflare_api_token",
         "api_keys",
         "oidc_issuer",
         "oidc_audience",
@@ -176,10 +212,14 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def _require_key_in_prod(self) -> Settings:
-        if self.strict and self.anthropic_api_key is None:
+        self._apply_cloudflare_model_defaults()
+        if self.llm_backend == "anthropic" and self.strict and self.anthropic_api_key is None:
             raise ValueError("ANTHROPIC_API_KEY is required outside dev/test")
-        if self.strict and self.llm_backend != "anthropic":
-            raise ValueError("DOCSPILOT_LLM_BACKEND must be 'anthropic' outside dev/test")
+        if self.strict and self.llm_backend == "fake":
+            raise ValueError("DOCSPILOT_LLM_BACKEND must be a real provider outside dev/test")
+        needs_cf = "cloudflare" in (self.llm_backend, self.embedder, self.rerank)
+        if needs_cf and not (self.cloudflare_account_id and self.cloudflare_api_token):
+            raise ValueError("CLOUDFLARE_ACCOUNT_ID and CLOUDFLARE_API_TOKEN are required")
         if self.strict and self.database_url is None:
             raise ValueError("DATABASE_URL is required outside dev/test")
         if self.strict and self.resolved_embedder == "hash":
