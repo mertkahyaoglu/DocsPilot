@@ -97,6 +97,11 @@ def to_openai_tools(tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
     ]
 
 
+def _is_quota(status: int, body: str) -> bool:
+    """The free tier's *daily* allocation: backoff cannot fix it before the next reset."""
+    return status == 429 and "daily" in body.lower() and "allocation" in body.lower()
+
+
 def _status_kind(status: int) -> ErrorKind:
     if status in (401, 403):
         return "auth"
@@ -171,6 +176,7 @@ class CloudflareLLM:
                             kind=_status_kind(res.status_code),
                             status_code=res.status_code,
                             request_id=res.headers.get("cf-ray"),
+                            retry_futile=_is_quota(res.status_code, body),
                         )
                     text_parts: list[str] = []
                     calls: dict[int, dict[str, Any]] = {}
@@ -219,7 +225,9 @@ class CloudflareLLM:
                     )
                     return
             except LLMError as exc:
-                if not (exc.retryable and not emitted and attempt < self._max_retries):
+                if exc.retry_futile or not (
+                    exc.retryable and not emitted and attempt < self._max_retries
+                ):
                     raise
                 error: LLMError = exc
             except httpx.TimeoutException as exc:

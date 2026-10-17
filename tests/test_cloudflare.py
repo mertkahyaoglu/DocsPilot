@@ -372,3 +372,19 @@ def test_workers_ai_models_are_priced() -> None:
 
     cost = cost_usd("@cf/openai/gpt-oss-120b", Usage(1_000_000, 1_000_000))
     assert cost == pytest.approx(0.35 + 0.75)
+
+
+async def test_daily_quota_exhaustion_is_not_retried() -> None:
+    calls = {"n": 0}
+    body = {
+        "errors": [{"message": "you have used up your daily free allocation of 10,000 neurons"}]
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        return httpx.Response(429, json=body)
+
+    with pytest.raises(LLMError) as info:
+        await complete(llm_with(handler, max_retries=3), REQ)
+    assert info.value.kind == "rate_limited" and info.value.retry_futile
+    assert calls["n"] == 1  # a transient 429 is retried, this one cannot succeed

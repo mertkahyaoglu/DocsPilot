@@ -484,7 +484,7 @@ async def test_http_user_is_never_defaulted_and_non_http_scopes_are_not_served()
     assert statuses == [200, 429] and passed == [1]
 
 
-def test_stdio_server_keeps_stdout_clean_for_json_rpc() -> None:
+def test_stdio_server_keeps_stdout_clean_for_json_rpc(tmp_path: Path) -> None:
     import os
     import subprocess
     import sys
@@ -493,6 +493,8 @@ def test_stdio_server_keeps_stdout_clean_for_json_rpc() -> None:
         **os.environ,
         "DOCSPILOT_LLM_BACKEND": "fake",
         "DOCSPILOT_RATE_LIMIT_PER_MIN": "0",
+        "DOCSPILOT_EMBEDDER": "hash",
+        "DOCSPILOT_RERANK": "none",
         "PYTHONUNBUFFERED": "1",
     }
     env.pop("DATABASE_URL", None)
@@ -503,7 +505,7 @@ def test_stdio_server_keeps_stdout_clean_for_json_rpc() -> None:
         stderr=subprocess.PIPE,
         text=True,
         env=env,
-        cwd=ROOT,
+        cwd=tmp_path,  # not the repo: a developer's .env must not leak into the test
     )
     try:
         request = {
